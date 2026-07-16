@@ -902,3 +902,43 @@ class DQCNode(QuantumRouter):
                     if protocol.name == msg.receiver:
                         protocol.received_message(src, msg)
                         break
+
+class QTCPNode(DQCNode):
+    """Code for QTCPNode class -- node that supports qTCP protocols + Distributed Quantum Computing
+
+    It is inherited from the DQCNode class so that QTCPNode can do all what a DQCNode can do, such as routing and teleportation.
+
+    Attributes:
+        name (str): Name of the quantum node.
+        timeline (Timeline): The timeline for scheduling operations.
+        seed (int): the seed of the this node's random number generator.
+        component_templates (dict): templates for the components of this node.
+        gate_fid (float): fidelity of gate operations (default is 1).
+        meas_fid (float): fidelity of measurement operations (default is 1).
+        memo_arr_name (str): name of the communication memory array.
+        resource_manager (ResourceManager): resource management module.
+        network_manager (NetworkManager): network management module.
+        map_to_middle_node (dict[str, str]): mapping of router names to intermediate bsm node names.
+        app (any): application in use on node.
+
+        data_memo_arr_name (str): name of the data memory array.
+        teleport_app (TeleportApp): The teleportation application instance.
+        teledata_app (TeledataApp): The teledata application instance.
+        telegate_app (TelegateApp): The telegate application instance.
+
+        apps (dict[str, any]): registered applications, keyed by the name used in Message.receiver.
+    """
+    def __init__(self, name: str, timeline: "Timeline", memo_size: int = 1, seed: int = None, component_templates: dict = None, 
+                 gate_fid: float = 1, meas_fid: float = 1, data_memo_size: int = 1):
+        super().__init__(name, timeline, memo_size, seed, component_templates or {}, gate_fid, meas_fid,data_memo_size)
+        self.apps : dict[str, Any] = {}
+   
+    def register_app(self, name: str, app) -> None:
+        """Register an app under the name its messages use as Message.receiver."""
+        self.apps[name] = app
+   
+    def receive_message(self, src: str, msg: "Message") -> None:
+        if msg.receiver in self.apps:
+            self.apps[msg.receiver].received_message(src, msg)
+        else:
+            super().receive_message(src, msg)
