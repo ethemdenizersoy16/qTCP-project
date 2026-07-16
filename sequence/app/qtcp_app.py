@@ -14,16 +14,15 @@ Contract:
 from dataclasses import dataclass, field
 from enum import Enum, auto
  
-from sequence.app.teleport_app import TeleportMessage, TeleportProtocol
+
 from sequence.components.circuit import Circuit
 from sequence.app.request_app import RequestApp
-from sequence.entanglement_management.teleportation import TeleportProtocol
 from sequence.kernel.event import Event
 from sequence.kernel.process import Process
 from sequence.message import Message
 from sequence.resource_management.memory_manager import MemoryInfo
 from sequence.utils import log
- 
+from sequence.entanglement_management.qtcp_teleportation import QTCPTeleportMessage, QTCPTeleportProtocol
  
 QTCP_APP = "qtcp_app"   # the Message.receiver string; keep as a constant so a
                         # typo is a NameError rather than a silently dropped message
@@ -94,7 +93,7 @@ class Transfer:
     probes: int = 0
     send_time: int = None
     comm_memory = None                 # sequence Memory, bound when a pair lands
-    protocol: TeleportProtocol = None  # kept so on_timeout can clean it up
+    protocol: QTCPTeleportProtocol = None  # kept so on_timeout can clean it up
     reason: FailureReason = None
     share_index: int = 0               # passthrough; this layer never interprets it
 
@@ -105,7 +104,7 @@ class BobTransfer:
     comm_memory_name: str
     state: BobState                 # NOTIFIED / ARRIVED / CANCELLED
     data_index: int = None
-    protocol: TeleportProtocol = None
+    protocol: QTCPTeleportProtocol = None
 
  
 class QTCPApp(RequestApp):
@@ -291,9 +290,10 @@ class QTCPApp(RequestApp):
         )
         self.node.send_message(transfer.dst, notice)
  
-        protocol = TeleportProtocol(
+        protocol = QTCPTeleportProtocol(
             self.node,
             alice=True,
+            transfer_id = transfer.transfer_id,
             data_memory_index=transfer.data_memory_index,
             remote_node_name=transfer.dst,
         )
@@ -339,21 +339,6 @@ class QTCPApp(RequestApp):
 
         return self.node.timeline.quantum_manager.get(key).state
     
-    def _bob_transfer_by_memory(self, comm_memory_name: str) -> BobTransfer | None:
-        """Find Bob's transfer record for a given comm memory name.
-
-        teleport_complete() enters holding a bare qstate key, resolves it to a
-        comm memory name, and needs the corresponding transfer record. The records
-        are keyed by transfer_id, so this scans on the comm_memory_name field.
-
-        Relies on the invariant that a comm memory name maps to at most one live
-        transfer (one entangled pair per memory at a time). O(n) in the number of
-        Bob's tracked transfers, which is bounded by the receiver window.
-        """
-        for transfer in self.bob_transfers.values():
-            if transfer.comm_memory_name == comm_memory_name and transfer.state is BobState.NOTIFIED:
-                return transfer
-        return None
 
     def alloc_data_slot(self) -> int | None:
         """Claim a free data memory index, or None if the array is full."""
@@ -367,6 +352,7 @@ class QTCPApp(RequestApp):
         if index is not None and index not in self.free_data_slots:
             self.free_data_slots.append(index)
 
+   
     def _memory_by_qstate_key(self, key: int):
         """Find the comm memory holding a given qstate key.
     
@@ -412,7 +398,7 @@ class QTCPApp(RequestApp):
             )
             return
         
-        tp = TeleportProtocol(self.node, alice=False, remote_node_name=src)
+        tp = QTCPTeleportProtocol(self.node, alice=False, transfer_id = tid, remote_node_name=src)
         tp.set_bob_comm_memory_name(msg.comm_memory_name)
         tp.set_bob_comm_memory( self._memory_by_name(msg.comm_memory_name))
 
@@ -511,8 +497,8 @@ class QTCPApp(RequestApp):
     
     
     def received_message(self, src: str, msg) -> None:
-        if isinstance(msg, TeleportMessage):
-            record = self._bob_transfer_by_memory(msg.bob_comm_memory_name)
+        if isinstance(msg, QTCPTeleportMessage):
+            record = self.bob_transfers.get(msg.transfer_id)
             if record and record.protocol:
                 record.protocol.received_message(src, msg)
             return
@@ -579,7 +565,7 @@ class QTCPApp(RequestApp):
     #Teleportation Complete (To be used by Bob)
     #------------------------------------------------------------------
 
-    def teleport_complete(self, comm_key: int) -> None:
+    def teleport_complete(self, comm_key: int, transfer_id: int) -> None:
         """Called locally by TeleportProtocol once corrections have been applied.
 
         At this point |psi> is sitting in Bob's COMM memory -- the entanglement was
@@ -595,7 +581,7 @@ class QTCPApp(RequestApp):
             log.logger.warning(f"{self.name}: teleport_complete for unknown key {comm_key}")
             return
 
-        transfer = self._bob_transfer_by_memory(comm_memory.name)
+        transfer = self.bob_transfers.get(transfer_id)
         if transfer is None:
             # Unannounced qubit: no SEND_NOTICE for this memory. Garbage -- discard.
             log.logger.warning(
