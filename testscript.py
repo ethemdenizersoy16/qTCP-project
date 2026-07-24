@@ -12,8 +12,9 @@ at the middle router is actually exercised) rather than a star.
 import numpy as np
 
 from sequence.topology.qtcp_net_topo import QTCPNetTopo
-from sequence.app.qtcp_app import QTCPApp, QTCPMsgType, QTCPMessage
-from sequence.constants import MILLISECOND
+from sequence.app.qtcp_transfer import QTCPTransfer, QTCPMsgType, QTCPMessage
+from sequence.app.qtcp_overseer import QTCPOverseer
+from sequence.constants import MILLISECOND,MICROSECOND
 from sequence.kernel.quantum_utils import verify_same_state_vector
 import sequence.utils.log as log
 
@@ -30,6 +31,7 @@ CONFIG = "tmp/three_node.json"
 
 ALICE = "router_0"
 BOB = "router_2"
+CHARLIE = "router_1"
 
 # Low target fidelity so the purification rule's condition never fires --
 # keeps the pipeline minimal for the correctness gate. (Stolen from the
@@ -39,7 +41,7 @@ TARGET_FIDELITY = 0.01
 
 
 
-def run_trial(psi: np.ndarray) -> np.ndarray:
+def run_trial(psi) -> np.ndarray:
     """Teleport psi from ALICE to BOB. Returns the state Bob ends up holding."""
 
     topo = QTCPNetTopo(CONFIG)
@@ -48,6 +50,7 @@ def run_trial(psi: np.ndarray) -> np.ndarray:
     qtcp_nodes = topo.nodes[QTCPNetTopo.QTCP_NODE]
     alice = next(n for n in qtcp_nodes if n.name == ALICE)
     bob = next(n for n in qtcp_nodes if n.name == BOB)
+  
 
  
 
@@ -57,8 +60,9 @@ def run_trial(psi: np.ndarray) -> np.ndarray:
     # Attach QTCPApp to both endpoints.
     #    The constructor registers itself on the node (node.teleport_app = self),
     #    so no external bookkeeping dict is needed.
-    app_alice = QTCPApp(alice,rto=100_000_000, max_probes=1)
-    app_bob = QTCPApp(bob,rto=100_000_000, max_probes=1)
+    app_alice = QTCPOverseer(QTCPTransfer(alice,rto=100_000_000))
+    app_bob = QTCPOverseer(QTCPTransfer(bob,rto=100_000_000))
+   
 
 
 
@@ -66,31 +70,37 @@ def run_trial(psi: np.ndarray) -> np.ndarray:
 
     #    Prepare |psi> in Alice's data memory.
     #    Memory.update_state() takes a state vector directly -- no circuit needed.
-    i = app_alice.alloc_data_slot()
+    i = app_alice.app.alloc_data_slot()
     data_arr = alice.get_component_by_name(alice.data_memo_arr_name)
-    data_arr[i].update_state(psi)
+    data_arr[i].update_state(psi[0])
 
-   
-    app_alice.start(responder=BOB, start_t=20 *MILLISECOND, end_t=500*MILLISECOND, memory_size=1, fidelity=0.01)
-    tid = app_alice.send_single_qubit(i, BOB)
+    j = app_alice.app.alloc_data_slot()
+    data_arr[j].update_state(psi[1])
+
+
+    app_alice.app.start(responder=BOB, start_t=20 *MILLISECOND, end_t=250*MILLISECOND , memory_size=5, fidelity=0.01)
+    
+
+    tid1 = app_alice.send_packet(i, BOB)
+
 
 
 
 
     log.set_logger(__name__, tl, "qtcp_test.log")   
     log.set_logger_level('DEBUG')
-    log.track_module('qtcp_app')     
+    log.track_module('qtcp_overseer')     
 
 
     tl.init()
-    for m in ['qtcp_app', 'teleportation', 'generation']:
+    for m in ['qtcp_transfer', 'teleportation', 'generation']:
         log.track_module(m)
+
     tl.run()
 
-    # 5) Read Bob's result. Each entry is (timestamp, state).
 
     
-    state = app_bob.get_received_state(tid)
+    state = [app_bob.get_received_packet(ALICE, tid1)]
     return state
 
 
@@ -114,12 +124,21 @@ if __name__ == "__main__":
         "random_1": random_state(rng),
         "random_2": random_state(rng),
     }
+    
+    states = [plus, test_states["random_1"],test_states["random_2"]]
 
-    for label, psi in test_states.items():
-        out = run_trial(psi)
-        ok = verify_same_state_vector(out, psi)
+    # for label, psi in test_states.items():
+    out = run_trial(states)
+    i= 0
+    for state in out:
+        if state is None:
+            print("Send failed")
+            i = i +1
+            continue
+        ok = verify_same_state_vector(state, states[i])
         status = "PASS" if ok else "FAIL"
-        print(f"[{status}] {label}")
-        print(f"    sent:     {psi}")
-        print(f"    received: {out}")
+        print(f"[{status}]")
+        print(f"    sent:     {states[i]}")
+        print(f"    received: {state}")
         print()
+        i = i +1

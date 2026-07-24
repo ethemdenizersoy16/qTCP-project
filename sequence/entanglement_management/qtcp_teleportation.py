@@ -91,4 +91,4 @@ class QTCPTeleportProtocol(TeleportProtocol):
             )
             log.logger.info(f"{self.name}: Z-flip applied on memory {msg.bob_comm_memory_name}")
  
-        self.owner.teleport_app.teleport_complete(bob_comm_memory_key, msg.transfer_id)
+        self.owner.teleport_app.teleport_complete(bob_comm_memory_key, msg.transfer_id, self.remote_node_name)
