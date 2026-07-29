@@ -14,8 +14,10 @@ Contract:
 from dataclasses import dataclass
 from enum import Enum, auto
 
+import sequence.app.qec as qec
 import numpy as np
 
+from sequence.constants import MILLISECOND
 from sequence.components.circuit import Circuit
 from sequence.app.request_app import RequestApp
 from sequence.kernel.event import Event
@@ -36,22 +38,47 @@ class QTCPMsgType(Enum):
     ACK         = auto()   # Bob -> Alice: "transfer N received"
     NACK        = auto()   # Bob -> Alice: "transfer N is lost/corrupt on my side"
     CANCEL      = auto()   # Alice -> Bob: "I gave up, no more bits coming"
- 
- 
+
+    MEM_REQ   = auto()
+    MEM_ACCEPT = auto()
+    MEM_REJECT = auto()
+
+    CLOSE = auto()
+
+    QPING_BASIS   = auto()   # Alice -> Bob: measure the pair on comm memory <comm_memory_name> in <basis>
+    QPING_OUTCOME = auto()   # Bob -> Alice: outcome bit for that pair
+
+
+    
 class QTCPMessage(Message):
     """Message for the qTCP transport layer."""
  
-    __slots__ = ["transfer_id", "share_index","packet_id", "comm_memory_name", "reason"]
+    __slots__ = ["transfer_id", "share_index", "packet_id",
+                 "parent_packet_id", "parent_share_index",
+                 "comm_memory_name", "reason", "payload","basis","outcome"]
  
     def __init__(self, msg_type: QTCPMsgType, transfer_id: int,
                  share_index: int = None, packet_id: int = None,
-                 comm_memory_name: str = None, reason: "FailureReason" = None):
+                 parent_packet_id: int = None, parent_share_index: int = None,
+                 comm_memory_name: str = None, payload: int = None,
+                 reason: "FailureReason" = None,
+                 basis: int = None, outcome: int = None):
         super().__init__(msg_type, QTCP_APP)
         self.transfer_id = transfer_id
         self.share_index = share_index
         self.packet_id = packet_id
+        # parent link: set on messages carrying shares of a sub-packet
+        # (recursion). None for top-level packets. Lets Bob route reconstructed
+        # sub-packets back into the parent packet's aggregation.
+        self.parent_packet_id = parent_packet_id
+        self.parent_share_index = parent_share_index
         self.comm_memory_name = comm_memory_name   # Bob's memory, for SEND_NOTICE
         self.reason = reason                       # for NACK
+
+        self.payload = payload
+
+        self.basis = basis       # QPING_BASIS: which Pauli basis Bob should measure in
+        self.outcome = outcome   # QPING_OUTCOME: Bob's measured bit
  
     def __str__(self) -> str:
         return f"QTCPMessage({self.msg_type.name}, transfer={self.transfer_id})"
@@ -62,6 +89,7 @@ class TransferStatus(Enum):
     IN_FLIGHT = auto()   # pair bound, Bell measurement fired, awaiting ACK
     DELIVERED = auto()   # terminal: Bob has it
     FAILED    = auto()   # terminal: gone
+
  
  
 class FailureReason(Enum):
@@ -90,6 +118,10 @@ class Transfer:
     reason: FailureReason = None
     share_index: int = None            # passthrough; this layer never interprets it
     packet_id: int = None
+    # parent link: set when this transfer is a share of a sub-packet
+    # (recursion). None for top-level packet shares.
+    parent_packet_id: int = None
+    parent_share_index: int = None
 
 @dataclass
 class BobTransfer:
@@ -101,6 +133,10 @@ class BobTransfer:
     protocol: QTCPTeleportProtocol = None
     share_index: int = None
     packet_id: int = None
+    # parent link: set on records for shares of a sub-packet (recursion).
+    # None for top-level packets.
+    parent_packet_id: int = None
+    parent_share_index: int = None
 
  
 class QTCPTransfer(RequestApp):
@@ -170,34 +206,45 @@ class QTCPTransfer(RequestApp):
         node.teleport_app = self
 
         self.terminal_observers: list = []
+   
+
+
         # --- sender state ---
         self.transfers: dict[int, Transfer] = {}
         self.next_transfer_id: int = 0
         self.pending: list[int] = []      # FIFO of transfer ids awaiting a pair
         self.rto: int = rto              # ps. TODO: derive from path latency
-        
+        self.reserved_at: dict[str, int] = {}
+        self.is_testing: bool = False
+
+        self._claimed_pairs: set = set()
+        self._last_fire_t = -1
+        self.flight_cap: int = 0
         # --- receiver state ---
         self.bob_transfers: dict[tuple[str, int], BobTransfer] = {}
-
+        self.reserved: int = 0
         data_arr = node.get_component_by_name(node.data_memo_arr_name)
         self.free_data_slots: (list[int]) = list(range(len(data_arr)))
 
         # --- instrumentation ---
         self.metrics: list[dict] = []
+        self._fire_count = 0
+        self._gm_count = 0
 
-
- 
         log.logger.debug(f"{self.name}: initialized")
  
     def start(self, responder, start_t, end_t, memory_size, fidelity):
+
         super().start(responder, start_t, end_t, memory_size, fidelity)
 
+        self.flight_cap = memory_size - 1
+        
         # Schedule the reservation-end sweep. Any transfer still queued in
         # self.pending at end_t never got a pair and never will -- the sweep
         # terminates each one as NO_ENTANGLEMENT. Without this, an unfired
         # transfer has no on_timeout (scheduled in _fire, which never ran)
         # and hangs forever.
-        process = Process(self, "on_reservation_end", [])
+        process = Process(self, "on_reservation_end", [responder])
         event = Event(end_t, process, self.node.timeline.schedule_counter)
         self.node.timeline.schedule(event)
 
@@ -205,9 +252,54 @@ class QTCPTransfer(RequestApp):
     # ------------------------------------------------------------------
     # sender: the primitive
     # ------------------------------------------------------------------
- 
+    def find_available_pair(self, dst: str):
+        """Proactively find an already-ENTANGLED comm pair for `dst` that a
+        consumer can use right now, without waiting for a fresh get_memory
+        edge.
+
+        Needed because get_memory is edge-triggered: a pair that became
+        ENTANGLED while no consumer was ready fired its edge already and won't
+        fire again. A consumer becoming ready (QPing wanting its next pair, or
+        a data transfer just queued) calls this to pick up such a standing
+        pair; on None it falls back to waiting for the next edge.
+
+        We do NOT release-to-RAW unwanted pairs (that desyncs the two ends and
+        stalls the simulator's time advance) -- we leave them standing and
+        fetch them on demand instead.
+
+        Filters: ENTANGLED, in one of our reservations, initiated by us, remote
+        end is `dst`, and NOT already bound to an in-flight transfer. The
+        last check matters for the parallel initial pair (two shares can be in
+        flight at once): without it a second fetch could re-pick a memory the
+        first fetch just bound but hasn't yet driven non-ENTANGLED.
+        """
+        mem_arr = self.node.get_component_by_name(self.node.memo_arr_name)
+        mgr = self.node.resource_manager.memory_manager
+
+        in_flight = {t.comm_memory for t in self.transfers.values()
+                     if t.status is TransferStatus.IN_FLIGHT
+                     and t.comm_memory is not None}
+
+        for memory in mem_arr:
+            info = mgr.get_info_by_memory(memory)
+            if info.state != "ENTANGLED":
+                continue
+            if info.index not in self.memo_to_reservation:
+                continue
+            if self._get_initiator_from_memory_info(self.node, info) != self.node.name:
+                continue
+            if info.remote_node != dst:
+                continue
+            if memory in in_flight:
+                continue
+
+            return info
+        return None
+    
     def send_single_qubit(self, data_memory_index: int, dst: str,
-                          share_index: int = None, packet_id: int = None) -> int:
+                          share_index: int = None, packet_id: int = None,
+                          parent_packet_id: int = None,
+                          parent_share_index: int = None) -> int:
         """Queue one data qubit for delivery to `dst`. Returns a transfer id.
  
         This does NOT teleport immediately -- there may be no entangled pair
@@ -222,7 +314,9 @@ class QTCPTransfer(RequestApp):
             data_memory_index=data_memory_index,
             dst=dst,
             share_index=share_index,
-            packet_id = packet_id
+            packet_id=packet_id,
+            parent_packet_id=parent_packet_id,
+            parent_share_index=parent_share_index,
         )
         self.transfers[transfer_id] = transfer
         self.pending.append(transfer_id)
@@ -231,11 +325,40 @@ class QTCPTransfer(RequestApp):
             f"{self.name}: queued transfer {transfer_id} "
             f"(data_memory={data_memory_index} -> {dst})"
         )
+
+        in_flight_count = sum(1 for t in self.transfers.values()
+                              if t.status is TransferStatus.IN_FLIGHT)
+        info = None
+        if in_flight_count < self.flight_cap:      
+            info = self.find_available_pair(dst)
+
+        
+        if info is not None:
+            self.pending.remove(transfer_id)
+            transfer.comm_memory = info.memory          # synchronous claim
+            transfer.status = TransferStatus.IN_FLIGHT  # excluded by in_flight set now
+
+            now = self.node.timeline.now()
+
+            # stagger fires within a bounded window past now, so bursts spread
+            # across a few ticks but the schedule can't run away from sim time
+            # (which under a small memory_size starves the pool and storms edges)
+            if self._last_fire_t < now:
+                self._last_fire_t = now
+            fire_t = self._last_fire_t + 1
+
+            
+            self._last_fire_t = fire_t
+
+            proc = Process(self, "_fire", [transfer, info])
+            evt = Event(fire_t, proc, self.node.timeline.schedule_counter)
+
+            self.node.timeline.schedule(evt)
         return transfer_id
 
     def mint_transfer_id(self) -> int:
         """Reserve a fresh transfer id without creating a Transfer record.
- 
+
         Used by the layer above for CANCEL messages on shares that were never
         actually fired -- e.g. a packet's un-sent shares once Bob has enough
         arrivals for reconstruction. Bob's _on_cancel synthesises a CANCELLED
@@ -245,38 +368,99 @@ class QTCPTransfer(RequestApp):
         transfer_id = self.next_transfer_id
         self.next_transfer_id += 1
         return transfer_id
+ 
     # ------------------------------------------------------------------
     # sender: pair arrives -> bind and fire
     # ------------------------------------------------------------------
- 
+    def _get_initiator_from_memory_info(self, node, info: "MemoryInfo") -> str:
+        """Extracts the reservation initiator's name for a given entangled memory."""
+        for rule in node.resource_manager.rule_manager.rules:
+            res = getattr(rule, 'reservation', None)
+            if not res:
+                continue
+                
+            mem_indices = getattr(rule, 'condition_args', {}).get('memory_indices', [])
+            
+            if info.index in mem_indices:
+                return res.initiator
+                
+        return None
+
+
+
     def get_memory(self, info: MemoryInfo) -> None:
-        """Called when a memory changes state. An ENTANGLED comm memory is the
-        resource a pending transfer has been waiting for.
- 
-        Unlike TeleportApp, we do NOT fire on any entangled pair -- we fire only
-        if a transfer is actually waiting. A pair with no pending transfer sits
-        idle and available, which is exactly what qTCP needs (handshake probes,
-        reserve pairs, shares not yet encoded).
+        """Called when a comm memory changes state. An ENTANGLED comm memory
+        belonging to one of our reservations is a resource that either QPing
+        (during the quality test) or a pending data transfer can consume.
+
+        A pair that nobody is ready to use right now is NOT left sitting: it is
+        released back to RAW so entanglement generation regenerates it and
+        fires this handler again later. Leaving it idle would strand the slot --
+        an idle ENTANGLED memory does not regenerate (nothing released it) and
+        does not re-fire get_memory (the edge already passed), so a slot full of
+        declined-idle pairs would stall generation and could deadlock a consumer
+        waiting for a fresh edge. Bouncing to RAW keeps every slot cycling, so a
+        pair is always moments away whenever someone becomes ready.
+
+        Priority when a pair arrives:
+          1. QPing, if the quality test is running and waiting for a pair.
+          2. A pending data transfer for this remote node.
+          3. Nobody ready -> release to RAW so it regenerates.
         """
-        log.logger.debug(f"{self.name}: get_memory index={info.index} state={info.state}")
+        #log.logger.debug(f"{self.name}: get_memory index={info.index} state={info.state}")
+
+        
+        
+        
         if info.index not in self.memo_to_reservation:
             return
         if info.state != "ENTANGLED":
             return
- 
-        for i, tid in enumerate(self.pending):
-            if self.transfers[tid].dst == info.remote_node:
-                self.pending.pop(i)
-                self._fire(self.transfers[tid], info)
+
+        node = self.node
+        initiator = self._get_initiator_from_memory_info(node, info)
+        if initiator is None or initiator != self.node.name:
+            return
+
+        # 1. QPing quality test: hand the pair over only if the test is
+        #    actively waiting for one. If the test is running but currently
+        #    awaiting Bob's outcome (loop is one-pair-at-a-time), this pair is
+        #    not wanted yet -- fall through to the release path so it does not
+        #    sit idle.
+        if self.is_testing:
+            for obs in self.terminal_observers:
+                if hasattr(obs, "qping_wants_pair") and obs.qping_wants_pair(info.remote_node):
+                    obs.on_qping_pair(info)
+                    return
+            # testing, but nobody is ready for a pair right now -> release below
+
+        # 2. Data phase: fire a pending transfer for this remote node.
+        else:
+            
+            for t in self.transfers.values():
+                if (t.status is TransferStatus.IN_FLIGHT
+                        and t.comm_memory is info.memory):
+                    return
+            if info.memory in self._claimed_pairs:
                 return
+            
+            for i, tid in enumerate(self.pending):
+                if self.transfers[tid].dst == info.remote_node:
+                    self.pending.pop(i)
+                    self._fire(self.transfers[tid], info)
+                    return
+
+
 
  
     def _fire(self, transfer: Transfer, info: MemoryInfo) -> None:
         """Bind a pair to a transfer, tell Bob it's coming, teleport, arm the timer."""
+
+
         transfer.comm_memory = info.memory
         transfer.status = TransferStatus.IN_FLIGHT
         transfer.send_time = self.node.timeline.now()
- 
+        self._claimed_pairs.discard(info.memory)
         # Tell Bob which transfer is arriving on which of his memories, BEFORE
         # the teleportation's MEASUREMENT_RESULT lands. Both messages are sent
         # at the same simulated time over the same classical channel, so they
@@ -289,6 +473,8 @@ class QTCPTransfer(RequestApp):
             transfer_id=transfer.transfer_id,
             share_index=transfer.share_index,
             packet_id=transfer.packet_id,
+            parent_packet_id=transfer.parent_packet_id,
+            parent_share_index=transfer.parent_share_index,
             comm_memory_name=info.remote_memo,
         )
         self.node.send_message(transfer.dst, notice)
@@ -336,8 +522,12 @@ class QTCPTransfer(RequestApp):
 
     def alloc_data_slot(self) -> int | None:
         """Claim a free data memory index, or None if the array is full."""
+
         if not self.free_data_slots:
           return None
+
+        if self.reserved > 0:
+            self.reserved -= 1
         return self.free_data_slots.pop(0)
  
  
@@ -426,6 +616,8 @@ class QTCPTransfer(RequestApp):
             state=BobState.NOTIFIED,
             share_index=msg.share_index,
             packet_id=msg.packet_id,
+            parent_packet_id=msg.parent_packet_id,
+            parent_share_index=msg.parent_share_index,
             protocol = tp
         )
     
@@ -456,10 +648,11 @@ class QTCPTransfer(RequestApp):
                 state=BobState.CANCELLED,
                 share_index=msg.share_index,
                 packet_id=msg.packet_id,
+                parent_packet_id=msg.parent_packet_id,
+                parent_share_index=msg.parent_share_index,
             )
-            log.logger.debug(f"{self.name}: transfer {tid} cancelled (synthetic record)")
             for obs in self.terminal_observers:
-                obs.on_bob_transfer_finished(self.bob_transfers[(src, tid)])
+                obs.on_bob_transfer_finished(self.bob_transfers.get((src, tid)))
             return
 
         if transfer.state is BobState.CANCELLED:
@@ -485,6 +678,10 @@ class QTCPTransfer(RequestApp):
         if transfer is None or transfer.status in (TransferStatus.DELIVERED,
                                                TransferStatus.FAILED):
             return
+
+        if src in self.reserved_at:
+            self.reserved_at[src] = max(0, self.reserved_at[src] - 1)
+
         self._finish(transfer, TransferStatus.DELIVERED)
 
     def _on_nack(self, src: str, msg) -> None:
@@ -493,8 +690,49 @@ class QTCPTransfer(RequestApp):
                                                TransferStatus.FAILED):
             return
         self._finish(transfer, TransferStatus.FAILED, msg.reason)
+
+    def _on_mem_req(self, src: str, msg: QTCPMessage) -> None:
+        requested = msg.payload
+        if requested is None:
+            log.logger.warning(f"{self.name}: MEM_REQ from {src} missing payload")
+            return
+
+        if len(self.free_data_slots) - self.reserved >= requested:
+            self.reserved += requested
+            
+            # Auto-reply with ACCEPT
+            tid = self.mint_transfer_id()
+            self.node.send_message(
+                src, 
+                QTCPMessage(QTCPMsgType.MEM_ACCEPT, transfer_id=tid)
+            )
+            
+            # Wake up Bob's handshake to start the Quality Assessment
+            for obs in self.terminal_observers:
+                if hasattr(obs, "on_inbound_connection_accepted"):
+                    obs.on_inbound_connection_accepted(src, requested)
+        else:
+            # Auto-reply with REJECT
+            tid = self.mint_transfer_id()
+            self.node.send_message(
+                src, 
+                QTCPMessage(QTCPMsgType.MEM_REJECT, transfer_id=tid)
+            )
+
+    def _on_mem_accept(self, src: str, msg: QTCPMessage) -> None:
+        # Wake up Alice's handshake layer to trigger the reservation / fidelity test
+        for obs in self.terminal_observers:
+            if hasattr(obs, "on_mem_accept"):
+                obs.on_mem_accept(src)
+
+    def _on_mem_reject(self, src: str, msg: QTCPMessage) -> None:
+        # Wake up Alice's handshake layer to gracefully abort
+        for obs in self.terminal_observers:
+            if hasattr(obs, "on_mem_reject"):
+                obs.on_mem_reject(src)
+
     
-    
+
     def received_message(self, src: str, msg) -> None:
         if isinstance(msg, QTCPTeleportMessage):
             record = self.bob_transfers.get((src, msg.transfer_id))
@@ -513,7 +751,34 @@ class QTCPTransfer(RequestApp):
             self._on_ack(src, msg)
         elif msg.msg_type is QTCPMsgType.NACK:
             self._on_nack(src, msg)
-        
+
+
+        # --- New Dispatches ---
+        elif msg.msg_type is QTCPMsgType.MEM_REQ:
+            self._on_mem_req(src, msg)
+        elif msg.msg_type is QTCPMsgType.MEM_ACCEPT:
+            self._on_mem_accept(src, msg)
+        elif msg.msg_type is QTCPMsgType.MEM_REJECT:
+            self._on_mem_reject(src, msg)
+
+        elif msg.msg_type is QTCPMsgType.CLOSE:
+            if msg.payload is not None:
+                self.reserved = max(0, self.reserved - msg.payload)
+            log.logger.info(
+                        f"Window coming from {src} is closed."
+                        f" Current reserved: {self.reserved}"
+                    )
+
+        elif msg.msg_type is QTCPMsgType.QPING_BASIS:
+            for obs in self.terminal_observers:
+                if hasattr(obs, "on_qping_basis"):
+                    obs.on_qping_basis(src, msg)
+
+        elif msg.msg_type is QTCPMsgType.QPING_OUTCOME:
+            for obs in self.terminal_observers:
+                if hasattr(obs, "on_qping_outcome"):
+                    obs.on_qping_outcome(src, msg)
+
         else:
             log.logger.debug(f"{self.name}: unknown message type")
    
@@ -549,6 +814,8 @@ class QTCPTransfer(RequestApp):
                 transfer_id=transfer_id,
                 packet_id=transfer.packet_id,
                 share_index=transfer.share_index,
+                parent_packet_id=transfer.parent_packet_id,
+                parent_share_index=transfer.parent_share_index,
             ),
         )
         self._finish(transfer, TransferStatus.FAILED, FailureReason.NO_ACK)
@@ -688,7 +955,7 @@ class QTCPTransfer(RequestApp):
     #------------------------------------------------------------------
     #Reservation sweep
     #------------------------------------------------------------------
-    def on_reservation_end(self) -> None:
+    def on_reservation_end(self, responder: str) -> None:
         """Diagnostic failsafe. Fires at end_t.
 
         Under the intended model (handshake-verified channel quality, single
@@ -705,6 +972,18 @@ class QTCPTransfer(RequestApp):
         Kept as a failsafe because the cost is zero when self.pending is empty
         and a hang is much harder to diagnose than a warning line.
         """
+        unused = self.reserved_at.pop(responder, 0)
+        tid = self.mint_transfer_id()
+        log.logger.info(
+                    f"{unused} slots of reservation unused."
+                    f" Sending message to {responder}"
+                )
+        self.node.send_message(
+            responder,
+            QTCPMessage(QTCPMsgType.CLOSE, transfer_id=tid, payload=unused),
+        )
+
+
         if not self.pending:
             return
 
@@ -730,13 +1009,30 @@ class QTCPTransfer(RequestApp):
                     transfer_id=transfer_id,
                     packet_id=transfer.packet_id,
                     share_index=transfer.share_index,
+                    parent_packet_id=transfer.parent_packet_id,
+                    parent_share_index=transfer.parent_share_index,
                 ),
             )
 
             self._finish(transfer, TransferStatus.FAILED,
                          FailureReason.NO_ENTANGLEMENT)
 
+    def measure_comm_in_basis(self, memory, circuit) -> int:
+        """Measure a comm memory's qubit with the given single-qubit basis
+        circuit (from qping.measurement_circuit) and return the outcome bit.
+        Consumes the pair -- the entanglement is destroyed by the measurement
+        -- then releases the comm memory so the window regenerates it.
+        Used by the handshake's QPing loop; not part of the data path."""
+        key = memory.qstate_key
+        rnd = self.node.get_generator().random()
+        meas = self.node.timeline.quantum_manager.run_circuit(circuit, [key], rnd)
+        outcome = int(meas[key])
+        self.node.resource_manager.update(None, memory, MemoryInfo.RAW)
+        return outcome
 
+
+
+    
     #This function is for TESTING ONLY
     def get_received_state(self, src:str, transfer_id: int):
         """Return the quantum state Bob holds for a completed transfer, or None

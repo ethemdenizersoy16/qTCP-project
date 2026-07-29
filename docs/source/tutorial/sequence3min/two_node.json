@@ -3,7 +3,7 @@
     "router_template": {
       "MemoryArray": {
         "frequency": 200000000.0,
-        "coherence_time": 2,
+        "coherence_time": -1,
         "efficiency": 1,
         "fidelity": 0.9
       }
