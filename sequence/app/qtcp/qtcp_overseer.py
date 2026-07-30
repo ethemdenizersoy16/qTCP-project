@@ -39,8 +39,8 @@ or on_bob_transfer_finished (Bob). Both handlers live here.
 from dataclasses import dataclass
 from enum import Enum, auto
 
-import sequence.app.qss as qss
-from sequence.app.qtcp_transfer import (
+import sequence.app.qtcp.qss as qss
+from sequence.app.qtcp.qtcp_transfer import (
     QTCPTransfer, Transfer, BobTransfer,
     QTCPMessage, QTCPMsgType,
     TransferStatus, BobState,

@@ -12,9 +12,8 @@ at the middle router is actually exercised) rather than a star.
 import numpy as np
 
 from sequence.topology.qtcp_net_topo import QTCPNetTopo
-from sequence.app.qtcp_transfer import QTCPTransfer, QTCPMsgType, QTCPMessage
-from sequence.app.qtcp_overseer import QTCPOverseer
-from sequence.app.qtcp_handshake import QTCPHandshake
+from sequence.app.qtcp.qtcp_app import QTCPApp
+
 from sequence.constants import MILLISECOND,MICROSECOND
 from sequence.kernel.quantum_utils import verify_same_state_vector
 import sequence.utils.log as log
@@ -68,7 +67,7 @@ def install_no_entanglement_monkeypatch(qtcp_transfer_instance, failure_set):
     also kill share 0 of packet 0's second attempt. To fail only the first
     attempt, use install_no_entanglement_monkeypatch_once instead.
     """
-    from sequence.app.qtcp_transfer import TransferStatus, FailureReason
+    from sequence.app.qtcp.qtcp_transfer import TransferStatus, FailureReason
     from sequence.utils import log
 
     failure_set = set(failure_set)
@@ -100,7 +99,7 @@ def install_no_entanglement_monkeypatch_once(qtcp_transfer_instance, failure_set
     This is the variant for testing local restart end-to-end: fail the first
     attempt's shares, let the restarted attempt deliver.
     """
-    from sequence.app.qtcp_transfer import TransferStatus, FailureReason
+    from sequence.app.qtcp.qtcp_transfer import TransferStatus, FailureReason
     from sequence.utils import log
 
     remaining = set(failure_set)
@@ -143,7 +142,8 @@ def run_trial(psi) -> np.ndarray:
     charlie = next(n for n in qtcp_nodes if n.name == CHARLIE)
   
 
- 
+    app_alice = QTCPApp(alice, 1,1,"recover")
+    app_bob = QTCPApp(bob, 1,1,"recover")
 
 
 
@@ -151,13 +151,7 @@ def run_trial(psi) -> np.ndarray:
     # Attach QTCPApp to both endpoints.
     #    The constructor registers itself on the node (node.teleport_app = self),
     #    so no external bookkeeping dict is needed.
-    alice_transfer = QTCPTransfer(alice,rto=100_000_000)
-    bob_transfer=QTCPTransfer(bob,rto=100_000_000)
-    app_alice = QTCPOverseer(alice_transfer)
-    app_bob = QTCPOverseer(bob_transfer)
-    alice_handshake = QTCPHandshake( alice_transfer)
-    bob_handshake = QTCPHandshake( bob_transfer)
-    app_charlie = QTCPOverseer(QTCPTransfer(charlie,rto=100_000_000))
+    
 
 
 
@@ -165,23 +159,23 @@ def run_trial(psi) -> np.ndarray:
 
     #    Prepare |psi> in Alice's data memory.
     #    Memory.update_state() takes a state vector directly -- no circuit needed.
-    i = app_alice.app.alloc_data_slot()
+    i = app_alice.transfer.alloc_data_slot()
     data_arr = alice.get_component_by_name(alice.data_memo_arr_name)
     data_arr[i].update_state(psi[0])
 
-    j = app_bob.app.alloc_data_slot()
+    j = app_bob.transfer.alloc_data_slot()
     data_arr2 = bob.get_component_by_name(bob.data_memo_arr_name)
     data_arr2[j].update_state(psi[1])
 
 
-    alice_handshake.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, payload = 10)
-    bob_handshake.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, payload=10)
+    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, num_qubits = 1)
+    app_bob.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, num_qubits = 1)
 
 
     tid1 = app_alice.send_packet(i, BOB)
    
     tid2 = app_bob.send_packet(j,ALICE)
-    install_no_entanglement_monkeypatch_once(app_alice.app, [(0, 1), (0, 2),(1,0),(1,1)])
+    install_no_entanglement_monkeypatch_once(app_alice.transfer, [(0, 1), (0, 2),(1,0),(1,1)])
 
 
 
@@ -191,7 +185,7 @@ def run_trial(psi) -> np.ndarray:
 
 
     tl.init()
-    for m in ['qtcp_transfer', 'teleportation', 'generation', "qtcp_handshake"]:
+    for m in ['qtcp_app', 'teleportation', 'generation', "qtcp_handshake","qtcp_transfer"]:
         log.track_module(m)
 
     tl.run()

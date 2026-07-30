@@ -14,7 +14,7 @@ Contract:
 from dataclasses import dataclass
 from enum import Enum, auto
 
-import sequence.app.qec as qec
+import sequence.app.qtcp.qec as qec
 import numpy as np
 
 from sequence.constants import MILLISECOND
@@ -192,7 +192,14 @@ class QTCPTransfer(RequestApp):
     _MEASURE_CIRCUIT = Circuit(1)
     _MEASURE_CIRCUIT.measure(0)
 
-    def __init__(self, node, rto: int):
+
+            # module-level constants
+    _RTO_MARGIN = 5          # safety multiple over the bare round-trip; RTO is
+                            # diagnostic, so err generous -- it must never fire on
+                            # a healthy transfer, only catch a genuine hang
+    _RTO_FLOOR = 1_000_000   # ps; floor so a near-zero-latency test topology still
+                            # gets a non-trivial timeout instead of ~0
+    def __init__(self, node):
         super().__init__(node)
         self.name = f"{node.name}.QTCPTransfer"
  
@@ -213,12 +220,11 @@ class QTCPTransfer(RequestApp):
         self.transfers: dict[int, Transfer] = {}
         self.next_transfer_id: int = 0
         self.pending: list[int] = []      # FIFO of transfer ids awaiting a pair
-        self.rto: int = rto              # ps. TODO: derive from path latency
+        self.rto: dict[str,int] = {}            
         self.reserved_at: dict[str, int] = {}
         self.is_testing: bool = False
 
         self._last_fire_t = -1
-        self.flight_cap: int = 0
 
         # --- receiver state ---
         self.bob_transfers: dict[tuple[str, int], BobTransfer] = {}
@@ -236,7 +242,6 @@ class QTCPTransfer(RequestApp):
 
         super().start(responder, start_t, end_t, memory_size, fidelity)
 
-        self.flight_cap = memory_size - 1
         
         # Schedule the reservation-end sweep. Any transfer still queued in
         # self.pending at end_t never got a pair and never will -- the sweep
@@ -325,11 +330,8 @@ class QTCPTransfer(RequestApp):
             f"(data_memory={data_memory_index} -> {dst})"
         )
 
-        in_flight_count = sum(1 for t in self.transfers.values()
-                              if t.status is TransferStatus.IN_FLIGHT)
-        info = None
-        if in_flight_count < self.flight_cap:      
-            info = self.find_available_pair(dst)
+      
+        info = self.find_available_pair(dst)
 
         
         if info is not None:
@@ -498,7 +500,7 @@ class QTCPTransfer(RequestApp):
         # Arm the retransmission timer. If the ACK lands first, on_timeout()
         # sees a terminal status and no-ops.
         timeout_process = Process(self, "on_timeout", [transfer.transfer_id])
-        timeout_event = Event(now + self.rto, timeout_process,
+        timeout_event = Event(now + self.rto.get(transfer.dst,self._RTO_FLOOR), timeout_process,
                               self.node.timeline.schedule_counter)
         self.node.timeline.schedule(timeout_event)
  
@@ -647,9 +649,9 @@ class QTCPTransfer(RequestApp):
                 parent_share_index=msg.parent_share_index,
             )
             for obs in self.terminal_observers:
-                obs.on_bob_transfer_finished(self.bob_transfers.get((src, tid)))
+                if hasattr(obs, "on_bob_transfer_finished"):
+                    obs.on_bob_transfer_finished(self.bob_transfers.get((src, tid)))
             return
-
         if transfer.state is BobState.CANCELLED:
             return  # duplicate cancel
 
@@ -663,7 +665,9 @@ class QTCPTransfer(RequestApp):
 
         transfer.state = BobState.CANCELLED
         for obs in self.terminal_observers:
-            obs.on_bob_transfer_finished(transfer)
+                if hasattr(obs, "on_bob_transfer_finished"):
+                    obs.on_bob_transfer_finished(self.bob_transfers.get((src, tid)))
+            
 
         log.logger.debug(f"{self.name}: transfer {tid} cancelled")
     
@@ -907,7 +911,8 @@ class QTCPTransfer(RequestApp):
             QTCPMessage(QTCPMsgType.ACK, transfer_id=transfer.transfer_id),
         )
         for obs in self.terminal_observers:
-            obs.on_bob_transfer_finished(transfer)
+            if hasattr(obs, "on_bob_transfer_finished"):
+                obs.on_bob_transfer_finished(transfer)
 
     def _finish(self, transfer, status, reason=None) -> None:
         """The one place a transfer reaches a terminal state.
@@ -945,7 +950,8 @@ class QTCPTransfer(RequestApp):
         )
     
         for obs in self.terminal_observers:
-            obs.on_alice_transfer_finished(transfer)
+            if hasattr(obs, "on_alice_transfer_finished"):
+                obs.on_alice_transfer_finished(transfer)
     
     #------------------------------------------------------------------
     #Reservation sweep
@@ -1027,17 +1033,58 @@ class QTCPTransfer(RequestApp):
 
 
 
+
+
+    def _one_way_classical_delay(self, dst: str) -> int:
+        """One-way classical propagation delay from this node to `dst`, in ps.
+
+        Current model: requires a DIRECT classical channel to `dst` and returns its
+        delay. qTCP's classical traffic (SEND_NOTICE, ACK, MEM_*, QPING_*) is
+        end-to-end, so a direct channel is assumed to exist; connect() validates
+        this. To support multi-hop classical forwarding later, this is the ONLY
+        function that changes: walk the classical route summing per-hop delays.
+        """
+        cchannels = self.node.cchannels
+        ch = cchannels.get(dst)
+        if ch is None:
+            raise ValueError(
+                f"{self.name}: no direct classical channel to {dst}; qTCP currently "
+                f"requires one. (Multi-hop classical routing is future work.)"
+            )
+        return ch.delay
+
+
+    def compute_rto(self, dst: str) -> int:
+        """Diagnostic retransmission timeout for transfers to `dst`, in ps.
+
+        NOT a retransmit timer -- this layer cannot resend (the qubit is consumed at
+        the Bell measurement; recovery is the overseer's QSS recursion/restart).
+        RTO only bounds how long a fired-but-unresolved transfer waits before
+        on_timeout reports it as NO_ACK, which the overseer then treats as a failed
+        share. So it must be comfortably longer than a healthy round-trip and short
+        enough to surface a real hang.
+
+        Round-trip a healthy transfer needs: SEND_NOTICE (Alice->Bob) + teleport
+        MEASUREMENT_RESULT (Alice->Bob) + ACK (Bob->Alice). That's ~2x the one-way
+        classical delay plus teleport-protocol overhead and Bob's processing, none
+        of which we model precisely -- the margin absorbs them.
+        """
+        one_way = self._one_way_classical_delay(dst)
+        rto = self._RTO_MARGIN * 2 * one_way
+        self.rto[dst] =  max(rto, self._RTO_FLOOR)
+        return self.rto[dst]
+
     
     #This function is for TESTING ONLY
     def get_received_state(self, src:str, transfer_id: int):
-        """Return the quantum state Bob holds for a completed transfer, or None
-        if nothing has arrived for that transfer."""
-        record = self.bob_transfers.get((src, transfer_id))
-        if record is None or record.state is not BobState.ARRIVED:
-            return None
-        
-        data_arr = self.node.get_component_by_name(self.node.data_memo_arr_name)
-        key = data_arr[record.data_index].qstate_key
-        
+            """Return the quantum state Bob holds for a completed transfer, or None
+            if nothing has arrived for that transfer."""
+            record = self.bob_transfers.get((src, transfer_id))
+            if record is None or record.state is not BobState.ARRIVED:
+                return None
+            
+            data_arr = self.node.get_component_by_name(self.node.data_memo_arr_name)
+            key = data_arr[record.data_index].qstate_key
+            
 
-        return self.node.timeline.quantum_manager.get(key).state
+            return self.node.timeline.quantum_manager.get(key).state

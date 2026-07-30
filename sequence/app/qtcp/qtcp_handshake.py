@@ -1,12 +1,11 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from sequence.app.qtcp_transfer import (
-    QTCPTransfer, Transfer, BobTransfer,
+from sequence.app.qtcp.qtcp_transfer import (
+    QTCPTransfer,
     QTCPMessage, QTCPMsgType,
-    TransferStatus, BobState,
 )
-import sequence.app.qping as qping
+import sequence.app.qtcp.qping as qping
 from sequence.utils import log
 
 @dataclass
@@ -95,7 +94,7 @@ class QTCPHandshake:
         self.pending_configs[dst] = ConnectionConfig(
             start_t, end_t, memory_size, 0.01, payload
         )
-
+        self.transfer.compute_rto(dst)
         
         tid = self.transfer.mint_transfer_id()
         msg = QTCPMessage(QTCPMsgType.MEM_REQ, transfer_id=tid, payload=payload)
@@ -145,20 +144,6 @@ class QTCPHandshake:
         self.states[src] = HandshakeState.CLOSED
         self.pending_configs.pop(src, None)  # Clean up memory
         log.logger.warning(f"{self.name}: {src} rejected MEM_REQ. Session aborted.")
-
-
-    def on_alice_transfer_finished(self, transfer: "Transfer") -> None:
-        """Observer callback from QTCPTransfer. Evaluates if we must yield the token."""
-        pass
-
-    def on_bob_transfer_finished(self, transfer: "BobTransfer") -> None:
-        """Triggered when Bob successfully receives a qubit.
-        
-        If Bob is in FIDELITY_TESTING_RECEIVER state, he intercepts this qubit, 
-        measures it for the fidelity test, and checks if he has received enough to score.
-        Otherwise, he passes it up to the application.
-        """
-        pass
 
 
     # ------------------------------------------------------------------
