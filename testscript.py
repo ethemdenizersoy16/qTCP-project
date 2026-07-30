@@ -175,13 +175,13 @@ def run_trial(psi) -> np.ndarray:
 
 
     alice_handshake.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, payload = 10)
-    #bob_handshake.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=500*MILLISECOND , memory_size=5, payload=10)
+    bob_handshake.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, payload=10)
 
 
     tid1 = app_alice.send_packet(i, BOB)
    
-    #tid2 = app_bob.send_packet(j,ALICE)
-    install_no_entanglement_monkeypatch_once(app_alice.app, [(0, 1), (0, 2)])
+    tid2 = app_bob.send_packet(j,ALICE)
+    install_no_entanglement_monkeypatch_once(app_alice.app, [(0, 1), (0, 2),(1,0),(1,1)])
 
 
 
@@ -198,7 +198,7 @@ def run_trial(psi) -> np.ndarray:
 
 
     
-    state = [app_bob.get_received_packet(ALICE, tid1)]
+    state = [app_bob.get_received_packet(ALICE, tid1),app_alice.get_received_packet(BOB, tid2)]
     return state
 
 

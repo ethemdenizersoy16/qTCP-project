@@ -217,9 +217,9 @@ class QTCPTransfer(RequestApp):
         self.reserved_at: dict[str, int] = {}
         self.is_testing: bool = False
 
-        self._claimed_pairs: set = set()
         self._last_fire_t = -1
         self.flight_cap: int = 0
+
         # --- receiver state ---
         self.bob_transfers: dict[tuple[str, int], BobTransfer] = {}
         self.reserved: int = 0
@@ -228,8 +228,7 @@ class QTCPTransfer(RequestApp):
 
         # --- instrumentation ---
         self.metrics: list[dict] = []
-        self._fire_count = 0
-        self._gm_count = 0
+ 
 
         log.logger.debug(f"{self.name}: initialized")
  
@@ -409,9 +408,6 @@ class QTCPTransfer(RequestApp):
         """
         #log.logger.debug(f"{self.name}: get_memory index={info.index} state={info.state}")
 
-        
-        
-        
         if info.index not in self.memo_to_reservation:
             return
         if info.state != "ENTANGLED":
@@ -437,12 +433,11 @@ class QTCPTransfer(RequestApp):
         # 2. Data phase: fire a pending transfer for this remote node.
         else:
             
-            for t in self.transfers.values():
+            for t in self.transfers.values(): #NOTE: Redundant?
                 if (t.status is TransferStatus.IN_FLIGHT
                         and t.comm_memory is info.memory):
                     return
-            if info.memory in self._claimed_pairs:
-                return
+
             
             for i, tid in enumerate(self.pending):
                 if self.transfers[tid].dst == info.remote_node:
@@ -460,7 +455,7 @@ class QTCPTransfer(RequestApp):
         transfer.comm_memory = info.memory
         transfer.status = TransferStatus.IN_FLIGHT
         transfer.send_time = self.node.timeline.now()
-        self._claimed_pairs.discard(info.memory)
+
         # Tell Bob which transfer is arriving on which of his memories, BEFORE
         # the teleportation's MEASUREMENT_RESULT lands. Both messages are sent
         # at the same simulated time over the same classical channel, so they
