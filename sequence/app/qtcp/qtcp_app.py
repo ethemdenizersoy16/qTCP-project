@@ -89,6 +89,10 @@ class QTCPApp:
         # Per-destination send accounting (qubit units, user-facing).
         self.packets_reserved: dict[str, int] = {}
         self.packets_sent: dict[str, int] = {}
+        self.handshake.state_observers.append(self)
+
+        self.established: set[str] = set()
+        self.pending_sends: dict[str, list[tuple[int,int]]] = {}
 
         log.logger.debug(f"{node.name}.QTCPApp: initialized")
 
@@ -179,19 +183,66 @@ class QTCPApp:
                 f"{self.node.name}.QTCPApp: send_packet to {dst} with no "
                 f"connection; call connect() first."
             )
-
         if self.packets_sent[dst] >= self.packets_reserved[dst]:
             raise RuntimeError(
                 f"{self.node.name}.QTCPApp: send_packet to {dst} exceeds the "
-                f"reserved budget of {self.packets_reserved[dst]} qubit(s). "
-                f"Reserve more at connect() time."
+                f"reserved budget of {self.packets_reserved[dst]} qubit(s)."
             )
 
+        # Budget is consumed at request time, whether we forward or hold, so the
+        # (num_qubits + 1)-th request is caught even before the connection opens.
         self.packets_sent[dst] += 1
-        return self.overseer.send_packet(data_memory_index, dst)
+        packet_id = self.overseer.mint_packet_id()
+
+        if dst in self.established:
+            return self.overseer.send_packet(data_memory_index, dst, packet_id=packet_id)
+
+        # Handshake still in progress -> hold until established.
+        self.pending_sends.setdefault(dst, []).append((packet_id, data_memory_index))
+
+        return packet_id
 
     def get_received_packet(self, src: str, packet_id: int):
         """Return the reconstructed secret state for (src, packet_id), or None
         if that packet has not been reconstructed. Passthrough to the overseer;
         primarily for testing."""
         return self.overseer.get_received_packet(src, packet_id)
+
+    def on_connection_established(self, dst: str) -> None:
+        """Handshake reached ESTABLISHED for dst: flush every held send, then
+        mark dst so future sends forward immediately."""
+        self.established.add(dst)
+        held = self.pending_sends.pop(dst, [])
+        for packet_id, data_memory_index in held:
+            self.overseer.send_packet(data_memory_index, dst, packet_id=packet_id)
+        if held:
+            log.logger.info(
+                f"{self.node.name}.QTCPApp: flushed {len(held)} held send(s) "
+                f"to {dst} on connection established"
+            )
+
+    def on_connection_rejected(self, dst: str) -> None:
+        """Handshake failed for dst (MEM_REJECT or QPing REJECT): discard held
+        sends. They never entered the transfer layer, so nothing to cancel --
+        just drop them and free the budget."""
+        held = self.pending_sends.pop(dst, [])
+        # Roll back the budget consumed by the discarded requests, and clear the
+        # reservation record so a later connect() to dst starts clean.
+        self.packets_sent.pop(dst, None)
+        self.packets_reserved.pop(dst, None)
+        self.established.discard(dst)
+        if held:
+            log.logger.warning(
+                f"{self.node.name}.QTCPApp: connection to {dst} rejected; "
+                f"discarded {len(held)} held send(s)"
+            )
+    def on_connection_closed(self, dst: str) -> None:
+        """Normal end-of-window teardown (from the transfer layer at end_t).
+        Drop dst from established so a future send_packet holds through the next
+        handshake instead of forwarding immediately, and clear the send
+        accounting so a reconnect starts with a fresh budget."""
+        self.established.discard(dst)
+        self.packets_sent.pop(dst, None)
+        self.packets_reserved.pop(dst, None)
+        self.pending_sends.pop(dst, None)
+        log.logger.debug(f"{self.node.name}.QTCPApp: connection to {dst} closed")

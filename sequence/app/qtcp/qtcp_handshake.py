@@ -71,6 +71,8 @@ class QTCPHandshake:
         self.pending_configs: dict[str, ConnectionConfig] = {}
         self.qping_sessions: dict[str, QPingSession] = {}
 
+        self.state_observers: list = []
+
         log.logger.debug(f"{self.name}: initialized")
 
     # ------------------------------------------------------------------
@@ -142,8 +144,11 @@ class QTCPHandshake:
     def on_mem_reject(self, src: str) -> None:
         """Alice's side: Bob denied the request. Abort session."""
         self.states[src] = HandshakeState.CLOSED
-        self.pending_configs.pop(src, None)  # Clean up memory
+        self.pending_configs.pop(src, None)
         log.logger.warning(f"{self.name}: {src} rejected MEM_REQ. Session aborted.")
+        for obs in self.state_observers:
+            if hasattr(obs, "on_connection_rejected"):
+                obs.on_connection_rejected(src)
 
 
     # ------------------------------------------------------------------
@@ -172,7 +177,7 @@ class QTCPHandshake:
 
         self.states[dst] = HandshakeState.FIDELITY_TESTING
         self.qping_sessions[dst] = QPingSession(dst=dst)
-        self.transfer.is_testing = True
+        self.transfer.is_testing[dst] = True
         log.logger.info(f"{self.name}: QPing quality test started for {dst}")
         self._qping_try_next_pair(dst)
 
@@ -285,8 +290,8 @@ class QTCPHandshake:
             return
 
         # terminal: stop testing, act on the verdict
-        self.transfer.is_testing = False
         self.qping_sessions.pop(src, None)
+        self.transfer.is_testing[src] = False
 
         if verdict is qping.QPingVerdict.ACCEPT:
             self.states[src] = HandshakeState.ESTABLISHED
@@ -294,6 +299,9 @@ class QTCPHandshake:
                 f"{self.name}: QPing ACCEPT for {src} after {session.trials} "
                 f"pairs ({session.passes} passed). State -> ESTABLISHED"
             )
+            for obs in self.state_observers:
+                if hasattr(obs, "on_connection_established"):
+                    obs.on_connection_established(src)
         else:
             self.states[src] = HandshakeState.CLOSED
             log.logger.warning(
@@ -301,6 +309,9 @@ class QTCPHandshake:
                 f"pairs ({session.passes} passed). Closing."
             )
             self._reject_close(src)
+            for obs in self.state_observers:
+                if hasattr(obs, "on_connection_rejected"):
+                    obs.on_connection_rejected(src)
 
     def _reject_close(self, dst: str) -> None:
         """Reject path: release Bob's reservation immediately rather than
@@ -315,6 +326,7 @@ class QTCPHandshake:
             dst,
             QTCPMessage(QTCPMsgType.CLOSE, transfer_id=tid, payload=unused),
         )
+
         for rule in self.node.resource_manager.rule_manager.rules:
             if getattr(rule, "reservation", None) and \
                rule.reservation.responder == dst:
@@ -323,3 +335,17 @@ class QTCPHandshake:
                     f"{self.name}: expired reservation rule for {dst} on reject"
                 )
                 break
+    def on_connection_closed(self, dst: str) -> None:
+        """Normal end-of-window teardown (from the transfer layer's sweep at
+        end_t). Reset this dst to CLOSED so a later connect() is accepted rather
+        than absorbed as redundant, and clear any lingering per-dst state. The
+        reject path resets its own state, so it does not route through here."""
+        self.states[dst] = HandshakeState.CLOSED
+        self.pending_configs.pop(dst, None)
+        self.qping_sessions.pop(dst, None)
+        self.transfer.is_testing.pop(dst, None)
+        log.logger.debug(f"{self.name}: connection to {dst} closed; state -> CLOSED")
+
+        for obs in self.state_observers:
+            if hasattr(obs, "on_connection_closed"):
+                obs.on_connection_closed(dst)

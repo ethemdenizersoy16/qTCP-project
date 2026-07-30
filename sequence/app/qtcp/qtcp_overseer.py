@@ -317,7 +317,7 @@ class QTCPOverseer:
         return secret_slot
 
     def send_packet(self, data_memory_index: int, dst: str,
-                    parent: tuple = None) -> int:
+                    parent: tuple = None,  packet_id: int = None) -> int:
         """Encode a single-qubit secret into N_SHARES shares and start
         delivery. Returns the packet id.
 
@@ -339,8 +339,9 @@ class QTCPOverseer:
         """
         slots = self._encode_at(data_memory_index)
 
-        packet_id = self.next_packet_id
-        self.next_packet_id += 1
+        if packet_id is None:
+            packet_id = self.next_packet_id
+            self.next_packet_id += 1
 
         parent_pid = parent[0] if parent is not None else None
         parent_share = parent[1] if parent is not None else None
@@ -1129,3 +1130,12 @@ class QTCPOverseer:
         """Hand off a reconstructed packet. Stores it for retrieval; the slot
         is not returned to the free pool -- it holds the recovered secret."""
         self.received_packets[(src, packet_id)] = data_index
+
+    def mint_packet_id(self) -> int:
+        """Reserve the next packet id without encoding or dispatching. The app
+        calls this at send-request time so it can hand the user a stable handle
+        before the packet is actually dispatched (which may be deferred until
+        the handshake establishes)."""
+        packet_id = self.next_packet_id
+        self.next_packet_id += 1
+        return packet_id

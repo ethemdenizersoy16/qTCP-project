@@ -26,6 +26,7 @@ from sequence.message import Message
 from sequence.resource_management.memory_manager import MemoryInfo
 from sequence.utils import log
 from sequence.entanglement_management.qtcp_teleportation import QTCPTeleportMessage, QTCPTeleportProtocol
+
  
 QTCP_APP = "qtcp_app"   # the Message.receiver string; keep as a constant so a
                         # typo is a NameError rather than a silently dropped message
@@ -222,7 +223,9 @@ class QTCPTransfer(RequestApp):
         self.pending: list[int] = []      # FIFO of transfer ids awaiting a pair
         self.rto: dict[str,int] = {}            
         self.reserved_at: dict[str, int] = {}
-        self.is_testing: bool = False
+
+        self.is_testing: dict[str,bool] = {}
+
 
         self._last_fire_t = -1
 
@@ -310,6 +313,9 @@ class QTCPTransfer(RequestApp):
         yet. The transfer sits in `pending` until get_memory() reports one, at
         which point it gets bound and fired.
         """
+
+
+
         transfer_id = self.next_transfer_id
         self.next_transfer_id += 1
  
@@ -322,6 +328,9 @@ class QTCPTransfer(RequestApp):
             parent_packet_id=parent_packet_id,
             parent_share_index=parent_share_index,
         )
+        
+
+
         self.transfers[transfer_id] = transfer
         self.pending.append(transfer_id)
 
@@ -425,7 +434,7 @@ class QTCPTransfer(RequestApp):
         #    awaiting Bob's outcome (loop is one-pair-at-a-time), this pair is
         #    not wanted yet -- fall through to the release path so it does not
         #    sit idle.
-        if self.is_testing:
+        if self.is_testing.get(info.remote_node, False):
             for obs in self.terminal_observers:
                 if hasattr(obs, "qping_wants_pair") and obs.qping_wants_pair(info.remote_node):
                     obs.on_qping_pair(info)
@@ -961,19 +970,30 @@ class QTCPTransfer(RequestApp):
 
         Under the intended model (handshake-verified channel quality, single
         connection at a time, reservation windows long enough for the work
-        queued into them), self.pending should be empty at end_t. Any transfer
-        still queued signals that the assumed model does not hold in this run:
-        connection was too short, channel quality is worse than the handshake
-        indicated, or the layer above miscounted somewhere.
+        queued into them), self.pending should hold no transfers for this
+        responder at end_t. Any still queued for it signals that the assumed
+        model does not hold in this run: connection was too short, channel
+        quality is worse than the handshake indicated, or the layer above
+        miscounted somewhere.
 
         If it does fire, terminate the stuck transfers as NO_ENTANGLEMENT (they
         never got a pair and never will now) and CANCEL to Bob so his
         aggregation does not deadlock waiting on shares that will not arrive.
 
-        Kept as a failsafe because the cost is zero when self.pending is empty
-        and a hang is much harder to diagnose than a warning line.
+        Only transfers bound for `responder` are swept. self.pending is shared
+        across all of this node's reservations, so clearing it wholesale would
+        strand still-valid transfers queued for other destinations whose
+        windows are still open.
+
+        Kept as a failsafe because the cost is zero when nothing is pending for
+        this responder and a hang is much harder to diagnose than a warning
+        line.
         """
-        unused = self.reserved_at.pop(responder, 0)
+        if responder not in self.reserved_at:
+            # Already torn down by the reject path -- no reservation left to close.
+            return
+
+        unused = self.reserved_at.pop(responder)
         tid = self.mint_transfer_id()
         log.logger.info(
                     f"{unused} slots of reservation unused."
@@ -984,40 +1004,41 @@ class QTCPTransfer(RequestApp):
             QTCPMessage(QTCPMsgType.CLOSE, transfer_id=tid, payload=unused),
         )
 
+        # Sweep ONLY transfers for this responder -- not the whole shared queue.
+        to_sweep = [tid for tid in self.pending
+                    if self.transfers[tid].dst == responder]
 
-        if not self.pending:
-            return
-
-        log.logger.warning(
-            f"{self.name}: reservation-end sweep found {len(self.pending)} "
-            f"PENDING transfers -- this should not happen under the intended "
-            f"model. Terminating as NO_ENTANGLEMENT."
-        )
-
-        to_sweep = list(self.pending)
-        self.pending.clear()
-
-        for transfer_id in to_sweep:
-            transfer = self.transfers.get(transfer_id)
-            if transfer is None or transfer.status is not TransferStatus.PENDING:
-                # defensive; PENDING <-> self.pending should be 1:1
-                continue
-
-            self.node.send_message(
-                transfer.dst,
-                QTCPMessage(
-                    QTCPMsgType.CANCEL,
-                    transfer_id=transfer_id,
-                    packet_id=transfer.packet_id,
-                    share_index=transfer.share_index,
-                    parent_packet_id=transfer.parent_packet_id,
-                    parent_share_index=transfer.parent_share_index,
-                ),
+        if to_sweep:
+            log.logger.warning(
+                f"{self.name}: reservation-end sweep found {len(to_sweep)} "
+                f"PENDING transfer(s) for {responder} -- this should not happen "
+                f"under the intended model. Terminating as NO_ENTANGLEMENT."
             )
+            for transfer_id in to_sweep:
+                self.pending.remove(transfer_id)
+                transfer = self.transfers.get(transfer_id)
+                if transfer is None or transfer.status is not TransferStatus.PENDING:
+                    continue
+                self.node.send_message(
+                    transfer.dst,
+                    QTCPMessage(
+                        QTCPMsgType.CANCEL,
+                        transfer_id=transfer_id,
+                        packet_id=transfer.packet_id,
+                        share_index=transfer.share_index,
+                        parent_packet_id=transfer.parent_packet_id,
+                        parent_share_index=transfer.parent_share_index,
+                    ),
+                )
+                self._finish(transfer, TransferStatus.FAILED,
+                             FailureReason.NO_ENTANGLEMENT)
 
-            self._finish(transfer, TransferStatus.FAILED,
-                         FailureReason.NO_ENTANGLEMENT)
-
+        # Normal-path teardown notification: let observers reset per-dst state so
+        # `responder` can be connected to again. (The reject path resets its own
+        # state and never reaches here, thanks to the reserved_at guard above.)
+        for obs in self.terminal_observers:
+            if hasattr(obs, "on_connection_closed"):
+                obs.on_connection_closed(responder)
     def measure_comm_in_basis(self, memory, circuit) -> int:
         """Measure a comm memory's qubit with the given single-qubit basis
         circuit (from qping.measurement_circuit) and return the outcome bit.
@@ -1080,6 +1101,8 @@ class QTCPTransfer(RequestApp):
             """Return the quantum state Bob holds for a completed transfer, or None
             if nothing has arrived for that transfer."""
             record = self.bob_transfers.get((src, transfer_id))
+            
+
             if record is None or record.state is not BobState.ARRIVED:
                 return None
             
