@@ -46,9 +46,9 @@ class QPingSession:
     current_basis: "qping.PauliBasis" = None
     current_alice_outcome: int = None
     # config (constants for the first cut)
-    f0: float = 0.5
+    f0: float = 0.7
     eta: float = 0.95
-    max_pairs: int = 100
+    max_pairs: int = 150
 
 
 

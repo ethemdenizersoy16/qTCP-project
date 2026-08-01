@@ -343,15 +343,3 @@ def correction_for(missing: tuple[int, int], syndrome: tuple[int, ...]) -> Circu
         raise KeyError(f"syndrome {syndrome} not in table for {missing}")
     return _CORRECTIONS[correction]
 
-# ======================================================================
-# helpers
-# ======================================================================
-
-def can_reconstruct(arrived: list[int]) -> bool:
-    """Whether the shares in hand suffice. Any K_THRESHOLD of N_SHARES do."""
-    return len(set(arrived)) >= K_THRESHOLD
-
-
-def missing_shares(arrived: list[int]) -> list[int]:
-    """Which share indices did not arrive (1-indexed)."""
-    return [i for i in range(1, N_SHARES + 1) if i not in set(arrived)]

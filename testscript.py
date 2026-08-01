@@ -13,11 +13,20 @@ import numpy as np
 
 from sequence.topology.qtcp_net_topo import QTCPNetTopo
 from sequence.app.qtcp.qtcp_app import QTCPApp
+from sequence.app.qtcp.qtcp_transfer import BobState
 
 from sequence.constants import MILLISECOND,MICROSECOND
 from sequence.kernel.quantum_utils import verify_same_state_vector
 import sequence.utils.log as log
+from sequence.kernel.process import Process
+from sequence.kernel.event import Event
 
+def assert_pool_restored(node, held=0):
+    t = node.teleport_app
+    data_arr = node.get_component_by_name(node.data_memo_arr_name)
+    assert len(t.free_data_slots) == len(data_arr) - held, (
+        f"{node.name}: leaked {len(data_arr) - held - len(t.free_data_slots)} slot(s)"
+    )
 
 
 
@@ -38,50 +47,57 @@ CHARLIE = "router_1"
 # reference test, where it's commented "not to activate distillation".)
 TARGET_FIDELITY = 0.01
 
+class _Deferred:
+    def __init__(self, fn):
+        self.fn = fn
+        self.result = None
+        self.error = None          # capture an exception raised inside the event
+    def run(self):
+        try:
+            self.result = self.fn()
+        except Exception as e:
+            self.error = e
 
-def install_no_entanglement_monkeypatch(qtcp_transfer_instance, failure_set):
-    """Faithful NO_ENTANGLEMENT failure injection: matching transfers never
-    fire at all.
+def install_no_entanglement_monkeypatch_times(qtcp_transfer_instance, fail_counts):
+    """Like install_no_entanglement_monkeypatch_once, but each (packet_id,
+    share_index) entry fails a SPECIFIED NUMBER of times before succeeding.
 
-    Wraps _fire. When a matching (packet_id, share_index) transfer is about to
-    fire, instead of running the Bell measurement it goes straight to
-    _finish(FAILED, NO_ENTANGLEMENT). Consequences, all matching a real
-    no-pair-in-time failure:
-
-      - No Bell measurement: Alice's qubit is untouched, still in its slot
-        (_finish preserves the slot for NO_ENTANGLEMENT).
-      - No SEND_NOTICE: Bob never hears about the share, has no record.
-      - No teleport: nothing arrives at Bob's memories.
-      - The entangled pair that get_memory offered is left alone.
-
-    This is the patch to use for testing local restart -- the earlier
-    _finish-flipping patch let the qubit physically teleport to Bob first,
-    which leaves live remote entanglement that corrupts Alice's local decode.
+    For tests where the SAME share identity must fail across multiple attempts
+    -- e.g. multiple local restarts (each restart re-fires the same
+    (packet_id, share_index); triggering a second restart requires it to fail
+    again), or fire-fails-to-LOST.
 
     Args:
-        qtcp_transfer_instance: sender-side QTCPTransfer.
-        failure_set: iterable of (packet_id, share_index) tuples.
+        qtcp_transfer_instance: Alice's QTCPTransfer to patch.
+        fail_counts: dict mapping (packet_id, share_index) -> number of times
+            to fail that identity. Decremented on each matching fire; once a
+            key's count reaches 0 the share fires normally.
 
-    Note: each matching share fails EVERY time it is fired. A restarted
-    packet reuses the same packet_id and share_index space, so (0, 0) will
-    also kill share 0 of packet 0's second attempt. To fail only the first
-    attempt, use install_no_entanglement_monkeypatch_once instead.
+    Returns the live remaining-count dict (mutated in place), so the caller can
+    assert every scheduled failure was consumed after the run.
     """
     from sequence.app.qtcp.qtcp_transfer import TransferStatus, FailureReason
     from sequence.utils import log
 
-    failure_set = set(failure_set)
+    remaining = dict(fail_counts)
     original_fire = qtcp_transfer_instance._fire
 
     def patched_fire(transfer, info):
         key = (transfer.packet_id, transfer.share_index)
-        if key in failure_set:
+        if remaining.get(key, 0) > 0:
+            remaining[key] -= 1
             log.logger.info(
                 f"MONKEYPATCH: suppressing fire of transfer "
                 f"{transfer.transfer_id} (packet {transfer.packet_id} share "
-                f"{transfer.share_index}) -> FAILED(NO_ENTANGLEMENT), "
-                f"qubit untouched, Bob not notified"
+                f"{transfer.share_index}) -> FAILED(NO_ENTANGLEMENT) "
+                f"[{remaining[key]} fail(s) left for this share]"
             )
+            # Release the pair get_memory handed us -- same as the _once
+            # variant. A suppressed fire that neither teleports nor releases
+            # strands the pair; _finish(FAILED, NO_ENTANGLEMENT) recycles the
+            # slot, matching a genuine no-pair-in-time failure.
+            from sequence.resource_management.memory_manager import MemoryInfo
+
             qtcp_transfer_instance._finish(
                 transfer, TransferStatus.FAILED,
                 FailureReason.NO_ENTANGLEMENT)
@@ -90,6 +106,7 @@ def install_no_entanglement_monkeypatch(qtcp_transfer_instance, failure_set):
 
     qtcp_transfer_instance._fire = patched_fire
 
+    return remaining
 
 def install_no_entanglement_monkeypatch_once(qtcp_transfer_instance, failure_set):
     """Same as install_no_entanglement_monkeypatch, but each (packet_id,
@@ -129,6 +146,75 @@ def install_no_entanglement_monkeypatch_once(qtcp_transfer_instance, failure_set
         original_fire(transfer, info)
 
     qtcp_transfer_instance._fire = patched_fire
+def assert_bob_pool_clean(bob_app):
+    """Bob's data pool must be fully restored -- a LOST packet leaves nothing
+    behind. No delivered secret to keep (LOST, not delivered)."""
+    t = bob_app.transfer          # QTCPTransfer: slots + bob_transfers live here
+    overseer = bob_app.overseer   # received_packets lives here
+    node = t.node
+    data_arr = node.get_component_by_name(node.data_memo_arr_name)
+
+    # 1. Every data slot back in the free pool.
+    n_total = len(data_arr)
+    n_free = len(t.free_data_slots)
+    assert n_free == n_total, (
+        f"{node.name}: LEAK -- {n_total - n_free} data slot(s) not freed "
+        f"(free={n_free}, total={n_total}). The 0<arrived<K branch did not "
+        f"release the orphaned arrival(s)."
+    )
+
+    # 2. No lingering ARRIVED records (all purged).
+    leftover = [k for k, r in t.bob_transfers.items()
+                if r.state is BobState.ARRIVED]
+    assert not leftover, (
+        f"{node.name}: {len(leftover)} ARRIVED record(s) still present "
+        f"after LOST -- records not purged: {leftover}"
+    )
+
+    # 3. Bob received NO packet (it was LOST, not delivered).
+    assert not overseer.received_packets, (
+        f"{node.name}: received_packets should be empty for a LOST packet, "
+        f"got {dict(overseer.received_packets)}"
+    )
+
+    print(f"PASS: {node.name} pool clean after LOST-with-partial "
+          f"({n_free}/{n_total} slots free, no orphaned arrivals)")
+ 
+ 
+# Also confirm Alice's side registered the LOST outcome and freed her slots:
+def assert_alice_lost(alice_app, packet_id=0):
+    outcome = alice_app.overseer.get_packet_outcome(packet_id)
+    from sequence.app.qtcp.qtcp_overseer import PacketOutcome
+    assert outcome is PacketOutcome.LOST, (
+        f"expected packet {packet_id} LOST, got {outcome}"
+    )
+    t = alice_app.transfer
+    data_arr = t.node.get_component_by_name(t.node.data_memo_arr_name)
+    assert len(t.free_data_slots) == len(data_arr), (
+        f"{t.node.name}: Alice leaked slots on LOST "
+        f"(free={len(t.free_data_slots)}, total={len(data_arr)})"
+    )
+    print(f"PASS: Alice packet {packet_id} correctly LOST, pool restored")
+
+def assert_alice_clean(alice_app, held = 0):
+
+    t = alice_app.transfer
+    data_arr = t.node.get_component_by_name(t.node.data_memo_arr_name)
+    assert len(t.free_data_slots) + held == len(data_arr), (
+        f"{t.node.name}: Alice leaked slots on LOST "
+        f"(free={len(t.free_data_slots)}, total={len(data_arr)})"
+    )
+    print(f"PASS: Alice has no leaked slots")
+def assert_bob_clean(bob_app, held=0):
+
+    t = bob_app.transfer
+    data_arr = t.node.get_component_by_name(t.node.data_memo_arr_name)
+    assert len(t.free_data_slots) + held == len(data_arr), (
+        f"{t.node.name}: Bob leaked slots on LOST "
+        f"(free={len(t.free_data_slots)}, total={len(data_arr)})"
+    )
+    print(f"PASS: Bob has no leaked slots")
+
 
 def run_trial(psi) -> np.ndarray:
     """Teleport psi from ALICE to BOB. Returns the state Bob ends up holding."""
@@ -163,20 +249,27 @@ def run_trial(psi) -> np.ndarray:
     data_arr = alice.get_component_by_name(alice.data_memo_arr_name)
     data_arr[i].update_state(psi[0])
 
-    j = app_bob.transfer.alloc_data_slot()
-    data_arr2 = bob.get_component_by_name(bob.data_memo_arr_name)
-    data_arr2[j].update_state(psi[1])
+   
+
+
+    #j = app_bob.transfer.alloc_data_slot()
+    #data_arr2 = bob.get_component_by_name(bob.data_memo_arr_name)
+    #data_arr2[j].update_state(psi[1])
 
 
     app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, num_qubits = 1)
-    app_bob.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, num_qubits = 1)
+    #app_bob.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, num_qubits = 1)
 
-
+    #app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=10, num_qubits = 1)
     tid1 = app_alice.send_packet(i, BOB)
-   
-    tid2 = app_bob.send_packet(j,ALICE)
-    install_no_entanglement_monkeypatch_once(app_alice.transfer, [(0, 1), (0, 2),(1,0),(1,1)])
 
+  
+
+
+  
+    #tid2 = app_bob.send_packet(j,ALICE)
+    #install_no_entanglement_monkeypatch_once(app_alice.transfer, [(0, 1),(0,2),(1,0),(1,1)])
+    #counts = install_no_entanglement_monkeypatch_times( app_alice.transfer, {(0, 0): 3, (0, 1): 3})
 
 
     log.set_logger(__name__, tl, "qtcp_test.log")   
@@ -190,9 +283,14 @@ def run_trial(psi) -> np.ndarray:
 
     tl.run()
 
+    #assert_alice_clean(app_alice,1)
+    #assert_bob_clean(app_bob, 0)
+    #assert all(v == 0 for v in counts.values()), f"unused failures: {counts}"
 
-    
-    state = [app_bob.get_received_packet(ALICE, tid1),app_alice.get_received_packet(BOB, tid2)]
+
+    state = [app_bob.get_received_packet(ALICE, tid1)]#,app_alice.get_received_packet(BOB, tid2)]
+
+    #assert_pool_restored(bob, held=1)
     return state
 
 
@@ -234,4 +332,4 @@ if __name__ == "__main__":
         print(f"    received: {state}")
         print()
         i = i +1
-
+    

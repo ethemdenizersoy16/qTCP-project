@@ -450,7 +450,7 @@ class QTCPOverseer:
         """
 
         record = self.packets[packet_id]
-        log.logger.info(f"ADVANCE packet {packet_id}: status={record.share_status}")
+
         if record.outcome is not PacketOutcome.IN_PROGRESS:
             return
 
@@ -499,6 +499,8 @@ class QTCPOverseer:
         record = self.packets[packet_id]
 
         while True:
+            if record.outcome is not PacketOutcome.IN_PROGRESS:
+                return
             delivered = sum(1 for s in record.share_status
                             if s is ShareStatus.DELIVERED)
             in_flight = sum(1 for s in record.share_status
@@ -598,11 +600,13 @@ class QTCPOverseer:
                 # the local decode.
                 for i in failed_positions:
                     self.app.free_data_slot(record.share_slots[i])
+
                 held_slots = [record.share_slots[i] for i in held_positions]
                 secret_slot = self._decode_at(
                     held_positions, held_slots, failed_positions,
                     desc=(f"packet {record.packet_id} recovered locally at "
                           f"exhaustion"))
+
                 self._finalize_recovered(record, secret_slot)
                 return True
 
@@ -855,6 +859,9 @@ class QTCPOverseer:
         record.recovered_slot = secret_slot
         record.outcome = PacketOutcome.RECOVERED_LOCALLY
 
+
+        record.share_status = [ShareStatus.FAILED] * qss.N_SHARES
+        record.share_slots = [None] * qss.N_SHARES
         log.logger.warning(
             f"QTCPOverseer: packet {record.packet_id} RECOVERED_LOCALLY "
             f"-> data memory {secret_slot} "
@@ -1027,12 +1034,15 @@ class QTCPOverseer:
                     f"QTCPOverseer: purged {len(stale_keys)} settled records "
                     f"for packet {packet_id} from {src}"
                 )
-            # With some arrivals (0 < arrived < K), records are kept: Bob
-            # still holds those qubits (and, until Alice's cleanup runs,
-            # they remain entangled with what she holds). Kept because a
-            # bidirectional recovery flow -- Bob returning his shares so
-            # Alice can decode from her held + his returned -- is not yet
-            # implemented; when it lands it will need these records.
+            else:
+                for r in arrived:
+                    self.app.free_data_slot(r.data_index)
+                    r.data_index = None
+                # purge the records too, same as the zero-arrival case
+                stale_keys = [key for key, rec in self.app.bob_transfers.items()
+                              if rec.src == src and rec.packet_id == packet_id]
+                for key in stale_keys:
+                    del self.app.bob_transfers[key]
             return
 
         log.logger.info(
@@ -1059,19 +1069,12 @@ class QTCPOverseer:
             (r for r in records if r.state is BobState.ARRIVED),
             key=lambda r: r.share_index,
         )
-        used = arrived[:qss.K_THRESHOLD]
-        surplus = arrived[qss.K_THRESHOLD:]
 
-        # Measure out surplus arrivals so their entanglement with the used
-        # shares does not corrupt the decode. _decode_at assumes clean
-        # erased positions.
-        for record in surplus:
-            log.logger.debug(
-                f"QTCPOverseer: packet {packet_id} share {record.share_index} "
-                f"arrived but is surplus; measuring out"
-            )
-            self.app.free_data_slot(record.data_index)
-            record.data_index = None
+        assert len(arrived) == qss.K_THRESHOLD, (
+            f"packet {packet_id}: expected exactly K={qss.K_THRESHOLD} arrivals, "
+            f"got {len(arrived)} -- fire policy invariant (<=K arrivals) violated"
+        )
+        used = arrived
 
         # Decode via helper. Non-used slots are freed inside.
         used_positions = [r.share_index for r in used]

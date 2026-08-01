@@ -144,6 +144,7 @@ class QTCPApp:
                 (surfaced early by the handshake via compute_rto), since qTCP's
                 classical traffic is end-to-end and currently requires one.
         """
+
         payload = self._payload_for(num_qubits)
 
         self.packets_reserved[dst] = num_qubits
@@ -246,3 +247,5 @@ class QTCPApp:
         self.packets_reserved.pop(dst, None)
         self.pending_sends.pop(dst, None)
         log.logger.debug(f"{self.node.name}.QTCPApp: connection to {dst} closed")
+
+
