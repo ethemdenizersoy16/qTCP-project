@@ -17,6 +17,7 @@ from enum import Enum, auto
 import sequence.app.qtcp.qec as qec
 import numpy as np
 
+from sequence.kernel.quantum_state import KetState
 from sequence.constants import MILLISECOND
 from sequence.components.circuit import Circuit
 from sequence.app.request_app import RequestApp
@@ -890,16 +891,48 @@ class QTCPTransfer(RequestApp):
             f"violated upstream and the fix belongs there, not here."
         )
 
-        # Move comm -> data. Must happen BEFORE releasing the comm memory.
+
+        # Move comm -> data by RELABELING the payload's key, not by running a
+        # SWAP circuit. A SWAP into an empty |0> slot is physically just a
+        # rename: the payload's amplitudes (and all their entanglement) stay
+        # put; only the key labeling that axis changes. Run as a circuit it
+        # builds a dense 2^n x 2^n operator over the comm qubit's whole
+        # entangled component (the recursion tree -> ~2^13 -> 16 GB). The
+        # relabel is O(1) and exact -- we never touch the state vector, so
+        # entanglement is preserved automatically.
         data_arr = self.node.get_component_by_name(self.node.data_memo_arr_name)
         data_key = data_arr[data_index].qstate_key
-        rnd = self.node.get_generator().random()
-        self.node.timeline.quantum_manager.run_circuit(
-            self._SWAP_CIRCUIT, [comm_key, data_key], rnd
+        qm = self.node.timeline.quantum_manager
+
+        # Target is guaranteed a lone |0>: fresh slots and freed slots are both
+        # reset to |0>. Assert it -- the failure mode is silent corruption
+        # (overwriting an entangled target loses its correlations), not a crash.
+        assert data_key in qm.states and len(qm.states[data_key].keys) == 1, (
+            f"{self.name}: cheat-swap target data_key={data_key} is not a lone "
+            f"qubit (keys="
+            f"{qm.states[data_key].keys if data_key in qm.states else 'MISSING'}"
+            f"); refusing to relabel onto an entangled/absent slot"
         )
 
-        rnd = self.node.get_generator().random()
-        self.node.timeline.quantum_manager.run_circuit(self._MEASURE_CIRCUIT, [comm_key], rnd)
+        comm_state = qm.states[comm_key]
+        assert comm_key in comm_state.keys, (
+            f"{self.name}: comm_key={comm_key} not in its own state's keys "
+            f"{comm_state.keys}"
+        )
+
+        # Relabel IN PLACE at the same index. Same index is essential: axes are
+        # positional, so replacing the label at the same position leaves the
+        # vector correct with the payload's axis now named data_key. Never
+        # reorder keys -- that desyncs labels from axes.
+        idx = comm_state.keys.index(comm_key)
+        comm_state.keys[idx] = data_key
+        qm.states[data_key] = comm_state
+
+        # comm_key's slot is vacated; give it a fresh |0> so the comm memory,
+        # about to be released to entanglement generation, holds what the pool
+        # expects (mirrors the |0> a real SWAP would leave behind).
+        qm.states[comm_key] = KetState([complex(1), complex(0)], [comm_key])
+
 
         transfer.data_index = data_index
         
@@ -1007,7 +1040,17 @@ class QTCPTransfer(RequestApp):
         # Sweep ONLY transfers for this responder -- not the whole shared queue.
         to_sweep = [tid for tid in self.pending
                     if self.transfers[tid].dst == responder]
+        to_sweep += [tid for tid, t in self.transfers.items()
+             if t.dst == responder
+             and t.status is TransferStatus.IN_FLIGHT
+             and tid not in to_sweep]
 
+        for obs in self.terminal_observers:
+            if hasattr(obs, "on_connection_closed"):
+                obs.on_connection_closed(responder)
+
+
+        
         if to_sweep:
             log.logger.warning(
                 f"{self.name}: reservation-end sweep found {len(to_sweep)} "
@@ -1015,9 +1058,10 @@ class QTCPTransfer(RequestApp):
                 f"under the intended model. Terminating as NO_ENTANGLEMENT."
             )
             for transfer_id in to_sweep:
-                self.pending.remove(transfer_id)
+                if transfer_id in self.pending:
+                    self.pending.remove(transfer_id)
                 transfer = self.transfers.get(transfer_id)
-                if transfer is None or transfer.status is not TransferStatus.PENDING:
+                if transfer is None or transfer.status not in (TransferStatus.PENDING, TransferStatus.IN_FLIGHT):
                     continue
                 self.node.send_message(
                     transfer.dst,
@@ -1036,9 +1080,7 @@ class QTCPTransfer(RequestApp):
         # Normal-path teardown notification: let observers reset per-dst state so
         # `responder` can be connected to again. (The reject path resets its own
         # state and never reaches here, thanks to the reserved_at guard above.)
-        for obs in self.terminal_observers:
-            if hasattr(obs, "on_connection_closed"):
-                obs.on_connection_closed(responder)
+
     def measure_comm_in_basis(self, memory, circuit) -> int:
         """Measure a comm memory's qubit with the given single-qubit basis
         circuit (from qping.measurement_circuit) and return the outcome bit.

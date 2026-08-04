@@ -38,6 +38,7 @@ or on_bob_transfer_finished (Bob). Both handlers live here.
 
 from dataclasses import dataclass
 from enum import Enum, auto
+import sequence.app.qtcp.qec as qec
 
 import sequence.app.qtcp.qss as qss
 from sequence.app.qtcp.qtcp_transfer import (
@@ -256,6 +257,7 @@ class QTCPOverseer:
         handles surplus arrivals explicitly. This helper assumes clean
         erased positions.
         """
+        
         assert len(used_positions) == qss.K_THRESHOLD
         assert len(used_slots) == qss.K_THRESHOLD
         assert len(erased_positions) == qss.N_SHARES - qss.K_THRESHOLD
@@ -316,7 +318,129 @@ class QTCPOverseer:
 
         return secret_slot
 
-    def send_packet(self, data_memory_index: int, dst: str,
+    def _decode_corrected(self, share_positions: list, share_slots: list,
+                          desc: str) -> int:
+        """Correction-mode decode of a full [[5,1,3]] codeword.
+
+        Unlike _decode_at (erasure mode: reconstruct from K survivors, treat
+        the rest as erased), this needs ALL N_SHARES shares present and finds
+        + fixes a single unknown Pauli error via stabiliser syndrome
+        extraction. Flow, distinct from erasure decode:
+
+            1. Order the 5 shares by CODE POSITION (not arrival order) and
+               allocate ONE ancilla slot in |0>.
+            2. For each of the 4 stabiliser generators: run its measurement
+               circuit on [5 shares in code order, ancilla]; read the ancilla
+               bit; reset the ancilla to |0> (X iff it read 1). This yields
+               the 4-bit syndrome. The single ancilla is reused across all
+               four -- peak width here is 5 shares + 1 ancilla = 6.
+            3. Look up syndrome -> (position, Pauli). If not clean, apply that
+               Pauli to the flagged share's slot.
+            4. Run the QSS DECODER (U-dagger) to extract the secret at
+               SECRET_INDEX, exactly as erasure decode does.
+            5. Free the ancilla and every slot except the secret's.
+
+        No fresh |0> spares are allocated (there are no erasures). No erasure
+        table is consulted -- the correction table is keyed on syndrome alone.
+
+        Args:
+            share_positions: the 5 code positions (should be 0..4). len == N.
+            share_slots: data slot per position, same order as share_positions.
+            desc: log-line description of the caller.
+
+        Returns the data slot holding the recovered secret.
+        """
+
+
+        assert len(share_positions) == qss.N_SHARES, (
+            f"correction mode needs all {qss.N_SHARES} shares; got "
+            f"{len(share_positions)} positions"
+        )
+        assert len(share_slots) == qss.N_SHARES
+        assert sorted(share_positions) == list(range(qss.N_SHARES)), (
+            f"correction mode expects positions 0..{qss.N_SHARES - 1}, got "
+            f"{sorted(share_positions)}"
+        )
+
+        qm = self.app.node.timeline.quantum_manager
+        data_arr = self.app.node.get_component_by_name(
+            self.app.node.data_memo_arr_name)
+
+        # 1) code-position-ordered slot list: slots[i] holds the share for
+        # code position i. Feeding the syndrome circuits in arrival order
+        # instead would compute the syndrome over the wrong qubits and
+        # silently miscorrect.
+        slots = [None] * qss.N_SHARES
+        for position, slot in zip(share_positions, share_slots):
+            slots[position] = slot
+
+        # one reused ancilla, allocated from the data pool (fresh slots are |0>)
+        ancilla_slot = self.app.alloc_data_slot()
+        assert ancilla_slot is not None, (
+            f"QTCPOverseer: pool exhausted allocating syndrome ancilla in "
+            f"_decode_corrected -- data memory config broken"
+        )
+
+        share_keys = [data_arr[s].qstate_key for s in slots]
+        ancilla_key = data_arr[ancilla_slot].qstate_key
+
+        # 2) extract the 4-bit syndrome, one generator at a time, reusing the
+        # single ancilla. The circuit acts on [share0..share4, ancilla]; its
+        # measurement targets the ancilla (index N_SHARES in the circuit).
+        syndrome_bits = []
+        for gen_index, circuit in enumerate(qec.STABILIZER_CIRCUITS):
+            circuit_keys = share_keys + [ancilla_key]
+            rnd = self.app.node.get_generator().random()
+            meas = qm.run_circuit(circuit, circuit_keys, rnd)
+            bit = int(meas[ancilla_key])
+            syndrome_bits.append(bit)
+            # reset ancilla to |0> for the next generator (it holds |bit> now)
+            if bit == 1:
+                rnd = self.app.node.get_generator().random()
+                qm.run_circuit(qec.ANCILLA_RESET, [ancilla_key], rnd)
+
+        syndrome = tuple(syndrome_bits)
+
+        # 3) look up and apply the correction to the flagged CODE qubit
+        # (before decoding -- correction mode fixes the codeword, then decodes)
+        correction = qec.correction_for(syndrome)
+        if correction is not None:
+            corr_position, corr_circuit = correction
+            corr_slot = slots[corr_position]
+            rnd = self.app.node.get_generator().random()
+            qm.run_circuit(
+                corr_circuit, [data_arr[corr_slot].qstate_key], rnd)
+
+        # ancilla is spent (holds |0> after the last reset, or |0>/|1> from the
+        # final measurement); free it back to the pool. free_data_slot measures
+        # it out and resets to |0>.
+        self.app.free_data_slot(ancilla_slot)
+
+        # 4) decode the corrected codeword with the QSS decoder. The DECODER
+        # measures the N-1 non-secret positions; we ignore its syndrome (the
+        # correction already happened above) and keep the secret at
+        # SECRET_INDEX.
+        rnd = self.app.node.get_generator().random()
+        qm.run_circuit(qss.DECODER, share_keys, rnd)
+
+        secret_slot = slots[qss.SECRET_INDEX]
+
+        log.logger.info(
+            f"QTCPOverseer: {desc} corrected-mode decode "
+            f"(syndrome {syndrome}, "
+            f"correction {correction is not None}"
+            + (f" at position {correction[0]}" if correction is not None else "")
+            + f") -> data memory {secret_slot}"
+        )
+
+        # 5) free every slot except the secret's
+        for position, slot in enumerate(slots):
+            if position != qss.SECRET_INDEX:
+                self.app.free_data_slot(slot)
+
+        return secret_slot
+    
+    def send_share(self, data_memory_index: int, dst: str,
                     parent: tuple = None,  packet_id: int = None) -> int:
         """Encode a single-qubit secret into N_SHARES shares and start
         delivery. Returns the packet id.
@@ -374,6 +498,133 @@ class QTCPOverseer:
 
         self._fire_shares(packet_id)
         return packet_id
+    def send_packet(self, data_memory_index: int, dst: str,
+                    packet_id: int = None) -> int:
+        """Encode a secret into N_SHARES [[5,1,3]] shares and deliver each via
+        send_share, sequentially, decoding in CORRECTION mode once all arrive.
+ 
+        This is the outermost layer. Its packet has parent_id == None, which
+        is how Bob knows to correction-decode rather than erasure-decode.
+ 
+        Sequential delivery: shares are handed to send_share one at a time --
+        the next only starts once the previous share's subtree has fully
+        resolved (delivered or failed). This keeps at most one send_share
+        subtree live at once, bounding the peak entangled width.
+ 
+        Returns the QEC packet id.
+        """
+        slots = self._encode_at(data_memory_index)
+        if packet_id is None:
+            packet_id = self.next_packet_id
+            self.next_packet_id += 1
+ 
+        # A QEC-layer PacketRecord. parent_* stay None (this IS the outermost
+        # layer). share_status tracks which of the N_SHARES have been handed
+        # to send_share and how they resolved. depth 0.
+        record = PacketRecord(
+            packet_id=packet_id,
+            dst=dst,
+            source_slot=data_memory_index,
+            share_slots=slots,
+            share_transfer_ids=[None] * qss.N_SHARES,
+            share_status=[ShareStatus.HELD] * qss.N_SHARES,
+            parent_packet_id=None,
+            parent_share_index=None,
+            depth=0,
+        )
+        self.packets[packet_id] = record
+ 
+        log.logger.info(
+            f"QTCPOverseer: QEC packet {packet_id} encoded from slot "
+            f"{data_memory_index} into {qss.N_SHARES} shares -> {dst} "
+            f"(slots {slots}) [outermost QEC layer]"
+        )
+ 
+        # Kick off the first share. The rest fire one at a time as each
+        # completes, driven by _advance_qec_packet from the parent cascade.
+        self._fire_next_qec_share(record)
+        return packet_id
+ 
+    def _fire_next_qec_share(self, record: PacketRecord) -> None:
+        """Hand the next still-HELD share to send_share, one at a time.
+ 
+        Sequential by construction: only ever one share IN_FLIGHT (here,
+        RECURSING -- each share is delivered by a full send_share subtree). We
+        start the next share only when none is currently RECURSING.
+        """
+        if record.outcome is not PacketOutcome.IN_PROGRESS:
+            return
+ 
+        # if a share subtree is still live, wait for it to resolve
+        if any(s is ShareStatus.RECURSING for s in record.share_status):
+            return
+ 
+        held = [i for i, s in enumerate(record.share_status)
+                if s is ShareStatus.HELD]
+        if not held:
+            return  # nothing left to start; resolution handled elsewhere
+ 
+        share_index = held[0]
+        slot = record.share_slots[share_index]
+ 
+        # Deliver this share via the loss layer, linked back to this QEC packet
+        # so its reconstruction feeds up here (and so its root is NOT
+        # parent-None -- preserving the QEC discriminator).
+        sub_packet_id = self.send_share(
+            data_memory_index=slot,
+            dst=record.dst,
+            parent=(record.packet_id, share_index),
+        )
+        record.share_transfer_ids[share_index] = sub_packet_id
+        record.share_status[share_index] = ShareStatus.RECURSING
+ 
+        log.logger.info(
+            f"QTCPOverseer: QEC packet {record.packet_id} delivering share "
+            f"{share_index} via send_share (sub-packet {sub_packet_id})"
+        )
+ 
+    def _advance_qec_packet(self, packet_id: int) -> None:
+        """Drive a QEC-layer packet forward after one of its shares resolves.
+ 
+        Called from the parent-cascade (_finalize_delivered / _finalize_lost)
+        when a send_share subtree that this QEC packet spawned reaches a
+        terminal and marks the corresponding share DELIVERED or FAILED.
+ 
+        Fail-stop: any FAILED share => the whole QEC packet is LOST (correction
+        needs all N_SHARES). Otherwise, once all N_SHARES are DELIVERED, Alice
+        is done sending -- Bob will correction-decode when his side settles.
+        Until then, start the next share.
+        """
+        record = self.packets[packet_id]
+        if record.outcome is not PacketOutcome.IN_PROGRESS:
+            return
+ 
+        # Any failed share is fatal in correction mode.
+        if any(s is ShareStatus.FAILED for s in record.share_status):
+            log.logger.warning(
+                f"QTCPOverseer: QEC packet {packet_id} has a failed share; "
+                f"correction mode needs all {qss.N_SHARES} -> LOST (fail-stop)"
+            )
+            self._finalize_lost(record)
+            return
+ 
+        delivered = sum(1 for s in record.share_status
+                        if s is ShareStatus.DELIVERED)
+        if delivered == qss.N_SHARES:
+            # All shares are on Bob's side. Alice is done; Bob correction-
+            # decodes when his aggregation settles (all N_SHARES arrived,
+            # fed up via the parent cascade). Alice's outcome resolves to
+            # DELIVERED here.
+            record.outcome = PacketOutcome.DELIVERED
+            log.logger.info(
+                f"QTCPOverseer: QEC packet {packet_id} all {qss.N_SHARES} "
+                f"shares delivered; awaiting Bob correction-decode"
+            )
+            return
+ 
+        # Not done, none failed -> start the next share.
+        self._fire_next_qec_share(record)
+
 
     def get_packet_outcome(self, packet_id: int) -> PacketOutcome | None:
         """Poll for terminal outcome. None if the packet id is unknown."""
@@ -475,6 +726,23 @@ class QTCPOverseer:
             return
 
         self._fire_shares(packet_id)
+
+    def _advance_parent(self, parent_packet_id: int) -> None:
+        """Route a parent-cascade advance to the right driver: the QEC layer
+        (parent-None, delivered via sequential send_share) uses
+        _advance_qec_packet; every other parent uses the generic
+        _advance_packet."""
+        parent = self.packets[parent_packet_id]
+        if parent.parent_packet_id is None:
+            # The parent is itself parent-None. That is the QEC layer -- it is
+            # the only parent-None packet that has children. (A normal
+            # parent-None packet, if any existed, would have no sub-packets
+            # cascading into it.)
+            self._advance_qec_packet(parent_packet_id)
+        else:
+            self._advance_packet(parent_packet_id)
+
+
 
     def _fire_shares(self, packet_id: int) -> None:
         """Fire (or recurse into) held shares up to the parallelism cap and
@@ -645,7 +913,7 @@ class QTCPOverseer:
             f"recursing at depth {record.depth} "
             f"(delivered={delivered}, held={held})"
         )
-        sub_packet_id = self.send_packet(
+        sub_packet_id = self.send_share(
             data_memory_index=slot,
             dst=record.dst,
             parent=(record.packet_id, share_index),
@@ -777,7 +1045,7 @@ class QTCPOverseer:
                 f"-> parent packet {parent.packet_id} share "
                 f"{record.parent_share_index} counts as DELIVERED"
             )
-            self._advance_packet(record.parent_packet_id)
+            self._advance_parent(record.parent_packet_id)
 
     def _finalize_lost(self, record: PacketRecord) -> None:
         """Loss path. Same cleanup as delivered -- Alice's slots freed, cancels
@@ -839,7 +1107,7 @@ class QTCPOverseer:
                 f"-> parent packet {parent.packet_id} share "
                 f"{record.parent_share_index} counts as FAILED; CANCEL sent"
             )
-            self._advance_packet(record.parent_packet_id)
+            self._advance_parent(record.parent_packet_id)
 
     def _finalize_recovered(self, record: PacketRecord,
                             secret_slot: int) -> None:
@@ -1070,23 +1338,46 @@ class QTCPOverseer:
             key=lambda r: r.share_index,
         )
 
-        assert len(arrived) == qss.K_THRESHOLD, (
+
+        used = arrived
+        used_positions = [r.share_index for r in used]
+        used_slots = [r.data_index for r in used]
+ 
+        # Is this the outermost QEC layer? It is iff NO record carries a parent
+        # link. (Every send_share root and every recursion sub-packet carries
+        # a non-None parent; only the QEC send_packet is parent-None.)
+        is_qec_layer = all(r.parent_packet_id is None for r in records)
+ 
+        if is_qec_layer:
+            # Correction mode needs the FULL codeword: all N_SHARES arrived.
+            # The QEC layer guarantees this (fail-stop: it goes LOST on any
+            # failed share, so it only ever reconstructs with all N_SHARES).
+            # If we are correction-decoding with fewer, the QEC invariant broke
+            # upstream -- trip loudly rather than silently miscorrect a partial
+            # codeword.
+            assert len(arrived) == qss.N_SHARES, (
+                f"packet {packet_id}: correction-mode decode reached with "
+                f"{len(arrived)}/{qss.N_SHARES} arrived shares. A parent-None "
+                f"packet must be the QEC layer, which only reconstructs with a "
+                f"full codeword. Either a non-QEC top-level packet leaked in "
+                f"(discriminator broken) or the QEC fail-stop policy was "
+                f"bypassed."
+            )
+            secret_slot = self._decode_corrected(
+                used_positions, used_slots,
+                desc=f"packet {packet_id} from {src}")
+        else:
+            # Erasure mode (unchanged): reconstruct from K, treat rest as erased.
+            assert len(arrived) == qss.K_THRESHOLD, (
             f"packet {packet_id}: expected exactly K={qss.K_THRESHOLD} arrivals, "
             f"got {len(arrived)} -- fire policy invariant (<=K arrivals) violated"
         )
-        used = arrived
-
-        # Decode via helper. Non-used slots are freed inside.
-        used_positions = [r.share_index for r in used]
-        used_slots = [r.data_index for r in used]
-        used_indices_set = set(used_positions)
-        erased = [i for i in range(qss.N_SHARES) if i not in used_indices_set]
-
-
-
-        secret_slot = self._decode_at(
-            used_positions, used_slots, erased,
-            desc=f"packet {packet_id} from {src} reconstructed")
+            used_indices_set = set(used_positions)
+            erased = [i for i in range(qss.N_SHARES)
+                      if i not in used_indices_set]
+            secret_slot = self._decode_at(
+                used_positions, used_slots, erased,
+                desc=f"packet {packet_id} from {src} reconstructed")
 
         for record in records:
             record.state = BobState.CONSUMED
@@ -1142,3 +1433,82 @@ class QTCPOverseer:
         packet_id = self.next_packet_id
         self.next_packet_id += 1
         return packet_id
+
+    def on_connection_closed(self, responder: str) -> None:
+            """Tear down every in-progress packet bound for `responder` at window
+            close, at PACKET granularity.
+    
+            For each in-progress packet to `responder`:
+            - ALL N_SHARES still HELD  -> safe to recover locally. Nothing has
+                left Alice, so her held shares are a self-contained entangled set;
+                decode them and finalize RECOVERED_LOCALLY (existing path).
+            - otherwise                -> LOST (ruthless). Some share is in
+                flight / recursing / delivered; recovering would require decoding
+                around state that has physically left Alice (entangled at Bob),
+                which is unsafe. A mid-flight window close is a sender-side
+                misconfiguration (end_t is the sender's choice), not something the
+                protocol recovers from.
+    
+            Finalizing here sets each packet's outcome terminal BEFORE the transfer
+            layer's sweep runs its per-share _finish. That makes the sweep's
+            cascade (and any trailing ACK) inert via the `outcome is not
+            IN_PROGRESS` guards in on_alice_transfer_finished / _advance_packet --
+            so no recursion, restart, or re-queue is triggered.
+    
+            Bob is cleaned up entirely by CANCELs: _finalize_lost / the local-
+            recover path CANCEL the held/failed shares; the sweep CANCELs the
+            in-flight/pending ones. No Bob-side change is needed.
+    
+            Iterate a snapshot (list(...)) because finalizing a packet can cascade
+            into its parent (mutating self.packets) mid-iteration.
+            """
+            for packet_id, record in list(self.packets.items()):
+                if record.dst != responder:
+                    continue
+                if record.outcome is not PacketOutcome.IN_PROGRESS:
+                    continue
+    
+                all_held = all(s is ShareStatus.HELD
+                            for s in record.share_status)
+    
+                if all_held:
+                    # Safe local recovery: every share is still HELD, so the whole
+                    # codeword is present, live, and clean in Alice's memory.
+                    #
+                    # Decode the FULL intact codeword: feed all N real shares to
+                    # the DECODER (U-dagger, the exact inverse of _encode_at's
+                    # ENCODER). The secret lands at SECRET_INDEX; the other N-1
+                    # positions measure out as ancillas. There are NO erasures and
+                    # NO |0> stand-ins -- an "erasure" in QSS means a genuinely
+                    # destroyed share replaced by a classical |0>, and the decoder
+                    # is a full N-qubit circuit that always takes N inputs. Faking
+                    # an erasure here by measuring out a live share would collapse
+                    # the entanglement of the ones we keep and damage the decode.
+                    # Since we hold the complete codeword, the clean move is the
+                    # direct inverse, not an erasure decode.
+                    slots = list(record.share_slots)   # code-position order: slots[i] is share i
+                    data_arr = self.app.node.get_component_by_name(
+                        self.app.node.data_memo_arr_name)
+                    keys = [data_arr[s].qstate_key for s in slots]
+                    rnd = self.app.node.get_generator().random()
+                    self.app.node.timeline.quantum_manager.run_circuit(
+                        qss.DECODER, keys, rnd)
+                    secret_slot = slots[qss.SECRET_INDEX]
+                    # DECODER measured the N-1 non-secret positions; free them.
+                    for i, s in enumerate(slots):
+                        if i != qss.SECRET_INDEX:
+                            self.app.free_data_slot(s)
+                    log.logger.warning(
+                        f"QTCPOverseer: packet {record.packet_id} recovered at "
+                        f"window close to {responder} (all shares still held) "
+                        f"-> data memory {secret_slot}"
+                    )
+                    self._finalize_recovered(record, secret_slot)
+                else:
+                    # Ruthless LOST: some share already left Alice.
+                    log.logger.warning(
+                        f"QTCPOverseer: packet {record.packet_id} LOST at window "
+                        f"close to {responder} (shares in flight/recursing/"
+                        f"delivered; no safe local recovery)"
+                    )
+                    self._finalize_lost(record)

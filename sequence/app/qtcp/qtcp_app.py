@@ -119,7 +119,7 @@ class QTCPApp:
         flight at once (if memory_size allows), so the reservation must cover
         all `num_qubits` peaking simultaneously: multiply.
         """
-        per_qubit = qss.N_SHARES + (qss.N_SHARES - 1) * self.max_recursion_depth
+        per_qubit = 4+ qss.N_SHARES + (qss.N_SHARES - 1) * self.max_recursion_depth
         return num_qubits * per_qubit
 
     # ------------------------------------------------------------------
@@ -242,6 +242,42 @@ class QTCPApp:
         Drop dst from established so a future send_packet holds through the next
         handshake instead of forwarding immediately, and clear the send
         accounting so a reconnect starts with a fresh budget."""
+        held = self.pending_sends.get(dst, [])
+        n_held = len(held)
+ 
+        if n_held > 0:
+            was_established = dst in self.established  # adjust to your accessor
+            if not was_established:
+                # Never established -> QPing never completed -> the usual cause
+                # is that entanglement never formed. The most common reason for
+                # that is an over-large memory_size: the reservation asked for
+                # more concurrent pairs than comm memory can supply, so it
+                # produced NONE (all-or-nothing) and starved the channel. A
+                # too-short window is the other possibility.
+                log.logger.warning(
+                    f"{self.node.name}: connection to {dst} closed with {n_held} "
+                    f"unflushed send(s) -- it never established, so no qubits "
+                    f"were sent. This usually means no entanglement was "
+                    f"generated: check that the reservation's memory_size fits "
+                    f"the available comm memory (an over-large memory_size "
+                    f"produces no pairs at all rather than fewer), and that the "
+                    f"window (start_t..end_t) is long enough for QPing to "
+                    f"complete."
+                )
+            else:
+                # Established but still holding sends at close -- shouldn't
+                # normally happen (flush runs on establish). Report distinctly
+                # so it is not misattributed to comm starvation.
+                log.logger.warning(
+                    f"{self.node.name}: connection to {dst} closed with {n_held} "
+                    f"unflushed send(s) despite having established -- these "
+                    f"sends did not go out before end_t. The window likely "
+                    f"closed before delivery could start; consider a longer "
+                    f"end_t."
+                )
+
+
+
         self.established.discard(dst)
         self.packets_sent.pop(dst, None)
         self.packets_reserved.pop(dst, None)

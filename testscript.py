@@ -228,9 +228,9 @@ def run_trial(psi) -> np.ndarray:
     charlie = next(n for n in qtcp_nodes if n.name == CHARLIE)
   
 
-    app_alice = QTCPApp(alice, 1,1,"recover")
-    app_bob = QTCPApp(bob, 1,1,"recover")
-
+    app_alice = QTCPApp(alice, 2,1,"recover")
+    app_bob = QTCPApp(bob, 2,1,"recover")
+    app_charlie = QTCPApp(charlie, 2,1, "recover")
 
 
 
@@ -245,30 +245,31 @@ def run_trial(psi) -> np.ndarray:
 
     #    Prepare |psi> in Alice's data memory.
     #    Memory.update_state() takes a state vector directly -- no circuit needed.
+    #i = app_alice.transfer.alloc_data_slot()
+    #data_arr = alice.get_component_by_name(alice.data_memo_arr_name)
+    #data_arr[i].update_state(psi[0])
     i = app_alice.transfer.alloc_data_slot()
     data_arr = alice.get_component_by_name(alice.data_memo_arr_name)
     data_arr[i].update_state(psi[0])
 
-   
+    
+    
 
-
-    #j = app_bob.transfer.alloc_data_slot()
+    #j = app_alice.transfer.alloc_data_slot()
     #data_arr2 = bob.get_component_by_name(bob.data_memo_arr_name)
-    #data_arr2[j].update_state(psi[1])
+    #data_arr[j].update_state(psi[1])
 
 
-    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, num_qubits = 1)
+    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=20*MILLISECOND + 500*MICROSECOND ,  memory_size=100, num_qubits = 1)
+    #app_alice.connect(dst=CHARLIE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, num_qubits = 1)
     #app_bob.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, num_qubits = 1)
 
-    #app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=10, num_qubits = 1)
-    tid1 = app_alice.send_packet(i, BOB)
-
   
 
-
-  
+    tid1 = app_alice.send_packet(i,BOB)
+    #tid2 = app_alice.send_packet(j, CHARLIE)
     #tid2 = app_bob.send_packet(j,ALICE)
-    #install_no_entanglement_monkeypatch_once(app_alice.transfer, [(0, 1),(0,2),(1,0),(1,1)])
+    #install_no_entanglement_monkeypatch_once(app_alice.transfer, [(1, 1),(1,2)])
     #counts = install_no_entanglement_monkeypatch_times( app_alice.transfer, {(0, 0): 3, (0, 1): 3})
 
 
@@ -283,12 +284,14 @@ def run_trial(psi) -> np.ndarray:
 
     tl.run()
 
-    #assert_alice_clean(app_alice,1)
-    #assert_bob_clean(app_bob, 0)
+    assert_alice_clean(app_alice,1)
+    assert_bob_clean(app_bob, 0)
     #assert all(v == 0 for v in counts.values()), f"unused failures: {counts}"
+    import resource
+    peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(f"Peak RSS: {peak_kb / 1024:.1f} MB")
 
-
-    state = [app_bob.get_received_packet(ALICE, tid1)]#,app_alice.get_received_packet(BOB, tid2)]
+    state = [app_bob.get_received_packet(ALICE, tid1)]
 
     #assert_pool_restored(bob, held=1)
     return state
@@ -318,6 +321,7 @@ if __name__ == "__main__":
     states = [plus, test_states["random_1"],test_states["random_2"]]
 
     # for label, psi in test_states.items():
+    
     out = run_trial(states)
     i= 0
     for state in out:
