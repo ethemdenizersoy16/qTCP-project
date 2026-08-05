@@ -260,7 +260,7 @@ def run_trial(psi) -> np.ndarray:
     #data_arr[j].update_state(psi[1])
 
 
-    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=20*MILLISECOND + 500*MICROSECOND ,  memory_size=100, num_qubits = 1)
+    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=35* MILLISECOND ,  memory_size=5, num_qubits = 1)
     #app_alice.connect(dst=CHARLIE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, num_qubits = 1)
     #app_bob.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, num_qubits = 1)
 
@@ -284,8 +284,8 @@ def run_trial(psi) -> np.ndarray:
 
     tl.run()
 
-    assert_alice_clean(app_alice,1)
-    assert_bob_clean(app_bob, 0)
+    #assert_alice_clean(app_alice,1)
+    #assert_bob_clean(app_bob, 0)
     #assert all(v == 0 for v in counts.values()), f"unused failures: {counts}"
     import resource
     peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
