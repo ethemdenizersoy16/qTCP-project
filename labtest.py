@@ -18,7 +18,7 @@ PACKET NUMBERING (single QEC packet, depth-first):
 
 Bit errors ride on top of the losses:
   1 error : X on (packet 1, share 0)   -> QEC share 0 corrupt -> corrected
-  2 errors: X on (1,0) and X on (4,0)  -> QEC shares 0 AND 1 corrupt.
+  2 errors: X on (1,0) and Z on (4,0)  -> QEC shares 0 AND 1 corrupt.
             [[5,1,3]] is distance 3: it CANNOT detect 2 errors (the syndrome
             table is a full 16<->16 bijection), so a 2-error state aliases to a
             single-error correction and is SILENTLY MISCORRECTED. The packet
@@ -89,7 +89,7 @@ def install_pauli_injection(transfer, targets):
 # --- targets (single-packet tree) -------------------------------------------
 LOSSES     = [(1, 1), (1, 2)]                       # force depth-2 (every test)
 INJECT_ONE = {(1, 0): "X"}                          # 1 error -> corrected
-INJECT_TWO = {(1, 0): "Z", (4, 0): "Z"}             # 2 errors -> miscorrected
+INJECT_TWO = {(1, 0): "X", (4, 0): "Z"}             # 2 errors -> miscorrected
 
 TESTS = [
     dict(name="depth2 clean",      inject={},
@@ -160,15 +160,15 @@ def _trial(sent_state, inject):
     return pid, outcome, received, alice_free, bob_free, rss
 
 
+
 def run_batch():
     rng = np.random.default_rng(12345)
     print("=" * 60)
     print("DEPTH-2 QEC BATCH")
     print("=" * 60)
     for t in TESTS:
-        # |0> for every test: X-sensitive, so an injected X shows if uncorrected
-        # (and a Z would be invisible). Clean test with |0> is fine too.
-        sent = np.array([1, 0], dtype=complex)
+        # Random state for sending
+        sent = random_state(rng)
 
         pid, outcome, received, a_free, b_free, rss = _trial(sent, t["inject"])
 
