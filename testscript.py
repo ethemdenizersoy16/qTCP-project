@@ -228,7 +228,7 @@ def run_trial(psi) -> np.ndarray:
     charlie = next(n for n in qtcp_nodes if n.name == CHARLIE)
   
 
-    app_alice = QTCPApp(alice, 2,1,"recover")
+    app_alice = QTCPApp(alice, 1,1,"recover")
     app_bob = QTCPApp(bob, 2,1,"recover")
     app_charlie = QTCPApp(charlie, 2,1, "recover")
 
@@ -260,7 +260,7 @@ def run_trial(psi) -> np.ndarray:
     #data_arr[j].update_state(psi[1])
 
 
-    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=35* MILLISECOND ,  memory_size=5, num_qubits = 1)
+    app_alice.connect(dst=BOB, start_t=20 *MILLISECOND, end_t=80* MILLISECOND ,  memory_size=5, num_qubits = 1)
     #app_alice.connect(dst=CHARLIE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND ,  memory_size=5, num_qubits = 1)
     #app_bob.connect(dst=ALICE, start_t=20 *MILLISECOND, end_t=80*MILLISECOND , memory_size=5, num_qubits = 1)
 
@@ -269,7 +269,7 @@ def run_trial(psi) -> np.ndarray:
     tid1 = app_alice.send_packet(i,BOB)
     #tid2 = app_alice.send_packet(j, CHARLIE)
     #tid2 = app_bob.send_packet(j,ALICE)
-    #install_no_entanglement_monkeypatch_once(app_alice.transfer, [(1, 1),(1,2)])
+    #install_no_entanglement_monkeypatch_once(app_alice.transfer, [(2, 1),(3,1)])
     #counts = install_no_entanglement_monkeypatch_times( app_alice.transfer, {(0, 0): 3, (0, 1): 3})
 
 

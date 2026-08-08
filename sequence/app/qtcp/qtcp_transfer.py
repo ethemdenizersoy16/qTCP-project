@@ -57,14 +57,16 @@ class QTCPMessage(Message):
  
     __slots__ = ["transfer_id", "share_index", "packet_id",
                  "parent_packet_id", "parent_share_index",
-                 "comm_memory_name", "reason", "payload","basis","outcome"]
+                 "comm_memory_name", "reason", "payload","basis","outcome",
+                 "is_qec_layer"]
  
     def __init__(self, msg_type: QTCPMsgType, transfer_id: int,
                  share_index: int = None, packet_id: int = None,
                  parent_packet_id: int = None, parent_share_index: int = None,
                  comm_memory_name: str = None, payload: int = None,
                  reason: "FailureReason" = None,
-                 basis: int = None, outcome: int = None):
+                 basis: int = None, outcome: int = None,
+                  is_qec_layer: bool = False):
         super().__init__(msg_type, QTCP_APP)
         self.transfer_id = transfer_id
         self.share_index = share_index
@@ -81,7 +83,7 @@ class QTCPMessage(Message):
 
         self.basis = basis       # QPING_BASIS: which Pauli basis Bob should measure in
         self.outcome = outcome   # QPING_OUTCOME: Bob's measured bit
- 
+        self.is_qec_layer = is_qec_layer   # True: this share is a QEC leaf block
     def __str__(self) -> str:
         return f"QTCPMessage({self.msg_type.name}, transfer={self.transfer_id})"
  
@@ -124,6 +126,7 @@ class Transfer:
     # (recursion). None for top-level packet shares.
     parent_packet_id: int = None
     parent_share_index: int = None
+    is_qec_layer: bool = False
 
 @dataclass
 class BobTransfer:
@@ -139,6 +142,7 @@ class BobTransfer:
     # None for top-level packets.
     parent_packet_id: int = None
     parent_share_index: int = None
+    is_qec_layer: bool = False
 
  
 class QTCPTransfer(RequestApp):
@@ -307,7 +311,8 @@ class QTCPTransfer(RequestApp):
     def send_single_qubit(self, data_memory_index: int, dst: str,
                           share_index: int = None, packet_id: int = None,
                           parent_packet_id: int = None,
-                          parent_share_index: int = None) -> int:
+                          parent_share_index: int = None,
+                          is_qec_layer: bool = False) -> int:
         """Queue one data qubit for delivery to `dst`. Returns a transfer id.
  
         This does NOT teleport immediately -- there may be no entangled pair
@@ -328,6 +333,7 @@ class QTCPTransfer(RequestApp):
             packet_id=packet_id,
             parent_packet_id=parent_packet_id,
             parent_share_index=parent_share_index,
+            is_qec_layer=is_qec_layer,
         )
         
 
@@ -483,6 +489,7 @@ class QTCPTransfer(RequestApp):
             parent_packet_id=transfer.parent_packet_id,
             parent_share_index=transfer.parent_share_index,
             comm_memory_name=info.remote_memo,
+            is_qec_layer=transfer.is_qec_layer,
         )
         self.node.send_message(transfer.dst, notice)
  
@@ -625,6 +632,7 @@ class QTCPTransfer(RequestApp):
             packet_id=msg.packet_id,
             parent_packet_id=msg.parent_packet_id,
             parent_share_index=msg.parent_share_index,
+            is_qec_layer=msg.is_qec_layer,
             protocol = tp
         )
     
@@ -651,12 +659,13 @@ class QTCPTransfer(RequestApp):
             self.bob_transfers[(src, tid)] = BobTransfer(
                 transfer_id=tid,
                 src=src,
-                comm_memory_name=None,      # no SEND_NOTICE ever arrived
+                comm_memory_name=None,
                 state=BobState.CANCELLED,
                 share_index=msg.share_index,
                 packet_id=msg.packet_id,
                 parent_packet_id=msg.parent_packet_id,
                 parent_share_index=msg.parent_share_index,
+                is_qec_layer=msg.is_qec_layer,
             )
             for obs in self.terminal_observers:
                 if hasattr(obs, "on_bob_transfer_finished"):

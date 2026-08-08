@@ -77,6 +77,10 @@ def install_pauli_injection(transfer, targets):
             transfer.node.timeline.quantum_manager.run_circuit(
                 _PAULI[p], [data_key], rnd)
             injected.add(key)
+            print(
+                f"[inject] {p} on transfer {t.transfer_id} "
+                f"(packet {t.packet_id} share {t.share_index} "
+                f"slot {t.data_memory_index}) before fire")
             log.logger.warning(
                 f"[inject] {p} on transfer {t.transfer_id} "
                 f"(packet {t.packet_id} share {t.share_index} "
@@ -87,9 +91,9 @@ def install_pauli_injection(transfer, targets):
   
 
 # --- targets (single-packet tree) -------------------------------------------
-LOSSES     = [(1, 1), (1, 2)]                       # force depth-2 (every test)
+LOSSES     = []                       # force depth-2 (every test)
 INJECT_ONE = {(1, 0): "X"}                          # 1 error -> corrected
-INJECT_TWO = {(1, 0): "X", (4, 0): "Z"}             # 2 errors -> miscorrected
+INJECT_TWO = {(1, 0): "Z",(1, 4): "Y"}             # 2 errors -> miscorrected
 
 TESTS = [
     dict(name="depth2 clean",      inject={},
@@ -100,7 +104,7 @@ TESTS = [
          expect_outcome="DELIVERED", expect_fidelity=False),   # miscorrected
 ]
 
-MAX_DEPTH = 2
+MAX_DEPTH = 1
 
 
 def _trial(sent_state, inject):
