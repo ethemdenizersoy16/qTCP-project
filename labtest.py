@@ -104,7 +104,7 @@ TESTS = [
          expect_outcome="DELIVERED", expect_fidelity=False),   # miscorrected
 ]
 
-MAX_DEPTH = 1
+MAX_DEPTH = 2
 
 
 def _trial(sent_state, inject):
