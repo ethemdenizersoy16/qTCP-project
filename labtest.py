@@ -91,7 +91,7 @@ def install_pauli_injection(transfer, targets):
   
 
 # --- targets (single-packet tree) -------------------------------------------
-LOSSES     = [(1,1),(1,2)]                       # force depth-2 (every test)
+LOSSES     = [(2,1),(2,2),(3,1),(3,2)]                       # force depth-2 (every test)
 INJECT_ONE = {(1, 0): "X"}                          # 1 error -> corrected
 INJECT_TWO = {(1, 0): "Z",(2, 0): "Y"}             # 2 errors -> miscorrected
 
