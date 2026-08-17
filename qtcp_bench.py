@@ -99,6 +99,11 @@ REALISTIC_MEAS_FID = 1.0
 # PILOT is deliberately wide and coarse: its job is to locate the knee.
 PILOT_ENT_FIDS = [1.0, 0.99, 0.95, 0.90, 0.80, 0.70]
 PILOT_N = 20
+PILOT_N_FIXED = 30      # exercise the fixed-state path too
+# The pilot runs the gate sweep as well. It is the newest and least-tested arm
+# -- it only works because of the injector, and its resume key differs from the
+# other two. Leaving it untested until the full run is the wrong risk.
+PILOT_GATE_FIDS = [1.0, 0.999, 0.99]
 
 # FULL grid, revised from preflight: check [2] gave success 1.00 / 0.75 / 0.25
 # at ent_fid 1.00 / 0.90 / 0.70, so the knee sits near 0.80. Points are dense
@@ -125,7 +130,7 @@ FIXED_STATES = {
 # All three, so no Pauli is invisible: Z is undetectable on |0>, X on |+>.
 
 MASTER_SEED = 20260817
-OUT_DIR = "benchmark_results"
+OUT_DIR = "/tmp/qtcp_bench"
 
 ROW_FIELDS = [
     "arm", "ent_fid", "gate_fid", "meas_fid",
@@ -1011,8 +1016,8 @@ def main():
             print("\nPreflight raised issues. Continuing with the pilot anyway")
             print("so you can see the curves, but do not scale up until they")
             print("are resolved -- a flat curve here is the classic silent bug.\n")
-        ent_fids, n_rand, n_fixed = PILOT_ENT_FIDS, PILOT_N, 0
-        gsweep = None
+        ent_fids, n_rand, n_fixed = PILOT_ENT_FIDS, PILOT_N, PILOT_N_FIXED
+        gsweep = PILOT_GATE_FIDS
         tag = "pilot"
     else:
         ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
@@ -1142,6 +1147,26 @@ def summarise(path):
             print(f"     {k[0]:10} ent_fid={k[1]:>7}  {v} trial(s)")
         print("     These are counted as not-delivered above, which understates")
         print("     the success rate. Widen CONNECT_END_MS and rerun.")
+
+    # Resource-counter spread. Metrics 3 and 4 are NOT binomial, so unlike the
+    # success rate their variance is a real unknown -- this is the part of N
+    # the pilot can actually inform.
+    print("\n" + "=" * 78)
+    print("RESOURCE COUNTERS (metrics 3 and 4 -- ingredients)")
+    print("=" * 78)
+    print(f'{"field":24} {"mean":>10} {"sd":>10} {"cv":>8} {"min":>8} {"max":>8}')
+    for f in ["ent_pairs_consumed", "classical_msgs", "gate_count",
+              "qubits_used", "memory_slot_time_us"]:
+        vals = [float(r[f]) for r in rows if r.get(f) not in ("", None)]
+        if not vals:
+            continue
+        a = np.array(vals)
+        cv = a.std() / a.mean() if a.mean() else 0.0
+        print(f"{f:24} {a.mean():10.2f} {a.std():10.2f} {cv:8.3f} "
+              f"{a.min():8.1f} {a.max():8.1f}")
+    print("  cv ~ 0 means the counter is deterministic and needs no extra N.")
+    print("  Metrics 3 and 4 are cost per DELIVERED qubit -- divide these by the")
+    print("  delivered count per point; the summary records ingredients only.")
 
     # metric-5 tail check
     st = [float(r["send_time_us"]) for r in rows if r["send_time_us"] != ""]
