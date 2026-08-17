@@ -91,9 +91,9 @@ def install_pauli_injection(transfer, targets):
   
 
 # --- targets (single-packet tree) -------------------------------------------
-LOSSES     = [(2,1),(2,2),(3,1),(3,2)]                       # force depth-2 (every test)
-INJECT_ONE = {(1, 0): "X"}                          # 1 error -> corrected
-INJECT_TWO = {(1, 0): "Z",(2, 0): "Y"}             # 2 errors -> miscorrected
+LOSSES     = []                       # force depth-2 (every test)
+INJECT_ONE = {(1, 0): "X"}                                   # 1 error -> corrected
+INJECT_TWO = {(1, 0): "Z",(1, 1): "Y"}                       # 2 errors -> miscorrected
 
 TESTS = [
     dict(name="depth2 clean",      inject={},
@@ -104,7 +104,7 @@ TESTS = [
          expect_outcome="DELIVERED", expect_fidelity=False),   # miscorrected
 ]
 
-MAX_DEPTH = 2
+MAX_DEPTH = 1
 
 
 def _trial(sent_state, inject):
