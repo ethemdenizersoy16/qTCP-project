@@ -140,7 +140,7 @@ ROW_FIELDS = [
     "ent_pairs_consumed", "classical_msgs", "classical_msgs_total",
     "gate_count", "gate_count_total",
     "qubits_used", "memory_slot_time_us",
-    "longest_share_us", "recursion_depth_max", "restart_count", "n_transfers",
+    "longest_share_us", "max_packet_id", "restart_count", "n_transfers",
     "paulis_injected", "meas_flips",
     "psi_sent", "psi_recv",
     "seed_base", "wall_s", "error",
@@ -268,16 +268,21 @@ class GateNoiseInjector:
                     n = getattr(circuit, "size", None) or len(keys)
                     p = (1.5 * (1.0 - gf)) if n == 1 else (1.25 * (1.0 - gf))
                     p = min(1.0, p)
+                    # ONE draw per gate, landing on one of the circuit's qubits.
+                    # Drawing per qubit PER gate multiplies the error rate by the
+                    # circuit width -- a 2-qubit 5-gate circuit would get 10 draws
+                    # where physics says 5. Which qubit each gate operates on is
+                    # not exposed, so the carrier is chosen uniformly; the total
+                    # error RATE, which is what gate_fid means, is correct.
                     ngates = (len(getattr(circuit, "gates", None) or [1])
                               if PER_GATE_NOISE else 1)
-                    for k in keys:
-                        for _ in range(ngates):
-                            if rng.random() < p:
-                                # orig_fn, not the wrapper -- the error circuit
-                                # must not itself be noised.
-                                orig_fn(paulis[rng.integers(3)], [k],
-                                        rng.random())
-                                self.paulis_applied += 1
+                    for _ in range(ngates):
+                        if rng.random() < p:
+                            k = keys[rng.integers(len(keys))]
+                            # orig_fn, not the wrapper -- the error circuit
+                            # must not itself be noised.
+                            orig_fn(paulis[rng.integers(3)], [k], rng.random())
+                            self.paulis_applied += 1
 
                 # --- measurement noise ------------------------------------
                 if mf < 1.0 and isinstance(res, dict) and res:
@@ -599,8 +604,10 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
         # entanglement generation keeps running after delivery; counting it
         # would swamp qTCP's protocol overhead in metric 4.
         if starts and ends:
-            t0, t1 = min(starts), max(ends)
-            gates_win, msgs_win = counters.gate_count(t0, t1), counters.msg_count(t0, t1)
+            # NOT t0/t1 -- t0 is the wall-clock start of the trial. Shadowing it
+            # with a picosecond sim timestamp makes wall_s meaningless.
+            w0, w1 = min(starts), max(ends)
+            gates_win, msgs_win = counters.gate_count(w0, w1), counters.msg_count(w0, w1)
         else:
             gates_win, msgs_win = counters.gate_count(), counters.msg_count()
 
@@ -617,7 +624,7 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
             gate_count_total=counters.gate_count(),
             qubits_used=counters.peak_slots(),
             memory_slot_time_us=round(counters.slot_time_us(), 3),
-            recursion_depth_max=counters.max_packet_id(),
+            max_packet_id=counters.max_packet_id(),
             restart_count=sum(1 for _, _, s, _ in counters.finishes
                               if s == "FAILED"),
             n_transfers=len(counters.finishes),
