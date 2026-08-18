@@ -11,9 +11,10 @@ row (see ROW_FIELDS); every metric is an aggregation over those rows. Rows are
 appended to CSV as they complete, so a crash loses at most the in-flight trials
 and a rerun skips what is already done.
 
-TWO ARMS, per the realism table:
-  ideal      gate/meas fidelity = 1.0, ent-gen swept   -> metric 2 (QPing knee)
-  realistic  gate/meas fidelity < 1.0, ent-gen swept   -> metrics 1, 3, 4, 5
+THREE ARMS:
+  ideal      gate/meas = 1.0,   ent-gen swept   -> metric 2 (QPing knee)
+  realistic  gate = 0.999,      ent-gen swept   -> metrics 1, 3, 4, 5
+  gatesweep  ent-gen = 1.0,     gate swept      -> hardware-requirement figure
 
 INPUT STATES: most trials use Haar-random states (correct for metric 1's
 average). A block at each point uses FIXED stabiliser states, because a clean
@@ -21,21 +22,29 @@ logical Pauli error averaged over random inputs gives mean fidelity 1/3 with a
 smooth spread -- which mimics "partial failure" and would make the metric-1 vs
 metric-2 comparison unanswerable. Fixed states collapse it to a sharp 0/1.
 
-ASSUMPTIONS -- all checked by preflight(), which fails loudly in the first
-seconds rather than silently three hours in:
-  A1  QPing threshold is set to 0 (passive) OUTSIDE this script. If QPing still
-      gates, low-fidelity points measure where you configured it to refuse, not
-      where delivery degrades, and the metric-2 knee becomes circular.
-  A2  gate_fidelity / measurement_fidelity are per-NODE keys in the config dict
-      (matching `node.get(Topo.GATE_FIDELITY, 1)` in _add_nodes).
-  A3  entanglement generation fidelity is templates.<tpl>.MemoryArray.fidelity.
-  A4  the cheat-swap has been reverted to a real circuit call, so gate fidelity
-      actually reaches the swap.
-  A5  one entry in transfer.metrics == one teleportation == one entangled pair.
-  A6  get_received_packet returns a 2-amplitude vector for a delivered qubit.
+ASSUMPTIONS. Checked by preflight(), which fails loudly in the first seconds
+rather than silently three hours in.
+  A1  QPing threshold is 0 (passive), set OUTSIDE this script. If QPing still
+      gates, the low-fidelity points measure where you configured it to refuse
+      rather than where delivery degrades, and the metric-2 knee is circular.
+  A2  entanglement generation fidelity is templates.<tpl>.MemoryArray.fidelity.
+      VERIFIED working -- it is the only native noise channel on this stack.
+  A3  one entry in transfer.metrics == one teleportation == one entangled pair.
+  A4  get_received_packet returns a 2-amplitude vector for a delivered qubit.
 
-This addition is for git to not ignore the file
+RESOLVED, recorded so it is not re-investigated:
+  node.gate_fid / node.meas_fid are read ONLY by purification/bbpssw_bds.py and
+  swapping/swapping_bds.py -- both Bell-Diagonal-State analytic updates. On
+  ket_vector, with purification off and adjacent nodes (no swap), neither runs,
+  so those config keys have no effect at all. Not a cheat-swap issue: with
+  adjacent nodes there is no swap to reach. Hence GateNoiseInjector.
 
+NOT MODELLED, for the Limitations section: loss (absent by construction in the
+teleportation regime, not merely unmodelled); memory decoherence (ket has no
+continuous decay -- unrepresentable, not just omitted, and teleportation needs
+ket for arbitrary |psi>); probabilistic entanglement generation (circuit-
+switched, instant retry); multi-hop swapping; purification; asymmetric readout;
+crosstalk; congestion.
 """
 
 import argparse
@@ -46,7 +55,6 @@ import os
 import sys
 import time
 import traceback
-from datetime import datetime
 
 import numpy as np
 
@@ -78,8 +86,8 @@ NUM_QUBITS = 1
 #                 average-fidelity -> Pauli-probability conversion.
 GATE_NOISE_MODE = "injected"
 
-# True: one error draw per GATE per qubit (physically right -- a 10-gate
-# circuit gets ~10x the error of a 1-gate circuit).
+# True: one error draw per GATE (physically right -- a 10-gate circuit gets
+# ~10x the error of a 1-gate circuit, independent of how wide the register is).
 # False: one draw per run_circuit CALL, which understates deep circuits.
 PER_GATE_NOISE = True
 
@@ -107,6 +115,7 @@ PILOT_N_FIXED = 30      # exercise the fixed-state path too
 # -- it only works because of the injector, and its resume key differs from the
 # other two. Leaving it untested until the full run is the wrong risk.
 PILOT_GATE_FIDS = [1.0, 0.999, 0.99]
+PILOT_LOSS_RATES = [0.0, 0.30, 0.50, 0.70]
 
 # FULL grid, revised from preflight: check [2] gave success 1.00 / 0.75 / 0.25
 # at ent_fid 1.00 / 0.90 / 0.70, so the knee sits near 0.80. Points are dense
@@ -120,7 +129,23 @@ FULL_ENT_FIDS = [1.0, 0.988, 0.979, 0.962, 0.95, 0.92, 0.90, 0.88,
 # states but never quantifies: qTCP "requires low error rate of transmission,
 # that is, it is more challenging in the hardware". The transition lives
 # between ~0.997 and ~0.9999.
-GATE_SWEEP_FIDS = [1.0, 0.9999, 0.9995, 0.999, 0.998, 0.997, 0.995, 0.99]
+GATE_SWEEP_FIDS = [1.0, 0.99999, 0.9999, 0.9995, 0.999, 0.998, 0.997, 0.995]
+
+# Per-transfer loss sweep, run at PERFECT entanglement and PERFECT gates so the
+# erasure behaviour is isolated from corruption.
+#
+# THIS IS THE ARM THAT ACTUALLY EXERCISES THE PROTOCOL. With no loss, nothing is
+# ever detected as failed, so the send-until-3 path and the restart path never
+# execute -- restart_count has been 0 and n_transfers exactly 15 on every trial
+# to date. Loss is the only thing that makes qTCP's recovery machinery run.
+#
+# Predicted break-even against bare teleportation at MAX_DEPTH=1: loss ~0.50
+# without the restart, ~0.58 with RESTART_AMOUNT=1. Grid brackets both.
+LOSS_SWEEP_RATES = [0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.45,
+                    0.50, 0.55, 0.60, 0.70]
+
+# Loss for the non-loss arms. Keep at 0.0 -- teleportation has no data-path loss.
+BASE_LOSS = 0.0
 
 FULL_N = 2000              # random-state trials per point
 FULL_N_FIXED = 400         # fixed-state trials per point
@@ -136,7 +161,7 @@ MASTER_SEED = 20260817
 OUT_DIR = "/tmp/qtcp_bench"
 
 ROW_FIELDS = [
-    "arm", "ent_fid", "gate_fid", "meas_fid",
+    "arm", "ent_fid", "gate_fid", "meas_fid", "loss_rate",
     "state_kind", "trial_idx",
     "delivered", "fidelity", "outcome",
     "send_time_us",
@@ -144,7 +169,7 @@ ROW_FIELDS = [
     "gate_count", "gate_count_total",
     "qubits_used", "memory_slot_time_us",
     "longest_share_us", "max_packet_id", "restart_count", "n_transfers",
-    "paulis_injected", "meas_flips",
+    "paulis_injected", "meas_flips", "loss_events", "fire_attempts",
     "psi_sent", "psi_recv",
     "seed_base", "wall_s", "error",
 ]
@@ -222,8 +247,11 @@ class GateNoiseInjector:
         p_error = 1.25 * (1 - two_qubit_gate_fid)     # two-qubit gates
 
     That is the standard average-gate-fidelity -> depolarizing-probability
-    conversion. On error, a uniformly random non-identity Pauli is applied to
-    each qubit the circuit touched. Measurement infidelity flips each returned
+    conversion. One draw is made PER GATE; on error a uniformly random
+    non-identity Pauli lands on one of the circuit's qubits, chosen uniformly
+    because which operand each gate acts on is not exposed. The total error
+    RATE -- which is what gate_fid means -- is therefore correct, and does not
+    scale with register width. Measurement infidelity flips each returned
     outcome bit with probability (1 - meas_fid).
 
     REPORT THIS HONESTLY: it is a channel model applied at the simulation
@@ -263,10 +291,6 @@ class GateNoiseInjector:
                 res = orig_fn(*args, **kwargs)
 
                 # --- gate noise -------------------------------------------
-                # One draw PER GATE per qubit, not per run_circuit call. A
-                # circuit carrying 10 gates should get ~10x the error of a
-                # circuit carrying 1; drawing once per call understates deep
-                # circuits by exactly that factor.
                 if gf < 1.0 and keys:
                     n = getattr(circuit, "size", None) or len(keys)
                     p = (1.5 * (1.0 - gf)) if n == 1 else (1.25 * (1.0 - gf))
@@ -279,9 +303,10 @@ class GateNoiseInjector:
                     # error RATE, which is what gate_fid means, is correct.
                     ngates = (len(getattr(circuit, "gates", None) or [1])
                               if PER_GATE_NOISE else 1)
+                    ks = list(keys)          # keys may be any iterable
                     for _ in range(ngates):
                         if rng.random() < p:
-                            k = keys[rng.integers(len(keys))]
+                            k = ks[rng.integers(len(ks))]
                             # orig_fn, not the wrapper -- the error circuit
                             # must not itself be noised.
                             orig_fn(paulis[rng.integers(3)], [k], rng.random())
@@ -299,6 +324,68 @@ class GateNoiseInjector:
 
         qm.run_circuit = make(original)
         self._undo.append(lambda: setattr(qm, "run_circuit", original))
+
+    def restore(self):
+        for fn in reversed(self._undo):
+            try:
+                fn()
+            except Exception:
+                pass
+        self._undo.clear()
+
+
+class StochasticLoss:
+    """Per-transfer erasure: each share fire fails with probability `rate`.
+
+    A stochastic version of install_no_entanglement_monkeypatch from
+    testscript.py. That one fails a FIXED list of (packet_id, share_index)
+    coordinates; this one fails each fire independently, which is what an
+    erasure channel is.
+
+    MODELLING NOTE FOR THE REPORT. This is NOT photon loss on the data qubit --
+    in teleportation the data qubit never crosses the channel, only classical
+    bits do. What is modelled is SHARE DELIVERY FAILURE: no entangled pair
+    available in time, teleportation did not complete. That is exactly the
+    FAILED/NO_ENTANGLEMENT path the protocol already has, so the failure is
+    handled by real protocol logic rather than by anything invented here.
+
+    Failing via _finish(FAILED, NO_ENTANGLEMENT) rather than simply dropping the
+    fire matters: a suppressed fire that neither teleports nor releases strands
+    the entangled pair and later transfers starve. _finish recycles the slot,
+    which is what a genuine no-pair-in-time failure looks like.
+    """
+
+    def __init__(self, rate=0.0, seed=0):
+        self.rate = rate
+        self.rng = np.random.default_rng(seed)
+        self.losses = 0
+        self.fires = 0
+        self._undo = []
+
+    def install(self, transfer):
+        if self.rate <= 0.0:
+            return
+        from sequence.app.qtcp.qtcp_transfer import TransferStatus, FailureReason
+
+        original = transfer._fire
+        rate, rng = self.rate, self.rng
+
+        def make(orig_fn):
+            def lossy(*args, **kwargs):
+                t = args[0] if args else kwargs.get("transfer")
+                self.fires += 1
+                if rng.random() < rate:
+                    self.losses += 1
+                    # transfer._finish, not a captured reference: resolves at
+                    # call time so the counters' wrapper still sees it and the
+                    # failure lands in restart_count.
+                    return transfer._finish(t, TransferStatus.FAILED,
+                                            FailureReason.NO_ENTANGLEMENT)
+                return orig_fn(*args, **kwargs)
+            return lossy
+
+        transfer._fire = make(original)
+        self._undo.append(lambda: setattr(transfer, "_fire", original))
 
     def restore(self):
         for fn in reversed(self._undo):
@@ -507,7 +594,7 @@ def ser(v):
 # ----------------------------------------------------------------------------
 
 def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
-              state_kind, trial_idx, seed_base):
+              state_kind, trial_idx, seed_base, loss_rate=0.0):
     """Build a fresh topology, send one qubit, return one fat row."""
     from sequence.topology.qtcp_net_topo import QTCPNetTopo
     from sequence.app.qtcp.qtcp_app import QTCPApp
@@ -517,10 +604,12 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
     t0 = time.time()
     row = {f: "" for f in ROW_FIELDS}
     row.update(arm=arm, ent_fid=ent_fid, gate_fid=gate_fid, meas_fid=meas_fid,
-               state_kind=state_kind, trial_idx=trial_idx, seed_base=seed_base)
+               loss_rate=loss_rate, state_kind=state_kind,
+               trial_idx=trial_idx, seed_base=seed_base)
 
     counters = TrialCounters()
     injector = None
+    losser = None
     try:
         cfg = build_config(base_cfg, ent_fid, gate_fid, meas_fid, seed_base)
 
@@ -560,6 +649,12 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
             injector = GateNoiseInjector(gate_fid, meas_fid,
                                          seed=int(seed_base) ^ 0x5EED)
             injector.install(tl.quantum_manager)
+
+        # Loss installs BEFORE the counters wrap _finish, so loss-induced
+        # failures are seen by the counter and land in restart_count.
+        if loss_rate > 0.0:
+            losser = StochasticLoss(loss_rate, seed=int(seed_base) ^ 0x10551)
+            losser.install(app_alice.transfer)
 
         counters.tl = tl
         counters.wrap_quantum_manager(tl.quantum_manager)
@@ -633,6 +728,8 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
             n_transfers=len(counters.finishes),
             paulis_injected=(injector.paulis_applied if injector else 0),
             meas_flips=(injector.meas_flips if injector else 0),
+            loss_events=(losser.losses if losser else 0),
+            fire_attempts=(losser.fires if losser else ""),
             psi_sent=ser(psi_sent),
             psi_recv=ser(psi_recv),
             error=note,
@@ -647,6 +744,8 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
         counters.restore()
         if injector is not None:
             injector.restore()
+        if losser is not None:
+            losser.restore()
 
     row["wall_s"] = round(time.time() - t0, 2)
     return row
@@ -656,22 +755,26 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
 # WORK PLAN
 # ----------------------------------------------------------------------------
 
-def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None):
+def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None):
     """Work plan as a list of arms.
 
     ideal      gate/meas perfect, ent-gen swept  -> metric 2 (QPing knee)
     realistic  gate 0.999, ent-gen swept         -> metrics 1, 3, 4, 5
     gatesweep  ent-gen perfect, gate swept       -> hardware requirement figure
+    losssweep  everything perfect, loss swept    -> the regime qTCP is FOR
     """
     arms = [
-        dict(name="ideal", ent_fids=ent_fids,
-             gate_fids=[1.0], meas_fids=[1.0]),
-        dict(name="realistic", ent_fids=ent_fids,
-             gate_fids=[REALISTIC_GATE_FID], meas_fids=[REALISTIC_MEAS_FID]),
+        dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
+             meas_fids=[1.0], losses=[BASE_LOSS]),
+        dict(name="realistic", ent_fids=ent_fids, gate_fids=[REALISTIC_GATE_FID],
+             meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]),
     ]
     if gate_sweep:
-        arms.append(dict(name="gatesweep", ent_fids=[1.0],
-                         gate_fids=gate_sweep, meas_fids=[REALISTIC_MEAS_FID]))
+        arms.append(dict(name="gatesweep", ent_fids=[1.0], gate_fids=gate_sweep,
+                         meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]))
+    if loss_sweep:
+        arms.append(dict(name="losssweep", ent_fids=[1.0], gate_fids=[1.0],
+                         meas_fids=[1.0], losses=loss_sweep))
 
     # seed_base is unique BY CONSTRUCTION, not by luck. Drawing ~100k random
     # 31-bit seeds gives ~2 expected birthday collisions, and a collision means
@@ -684,8 +787,9 @@ def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None):
     jobs = []
     for arm in arms:
         for ef in arm["ent_fids"]:
-            for gf in arm["gate_fids"]:
-                for mf in arm["meas_fids"]:
+          for gf in arm["gate_fids"]:
+            for mf in arm["meas_fids"]:
+                for lr in arm["losses"]:
                     kinds = [("random", n_random)]
                     if n_fixed:
                         per = max(1, n_fixed // len(FIXED_STATES))
@@ -696,8 +800,8 @@ def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None):
                             si += 1
                             jobs.append(dict(
                                 arm=arm["name"], ent_fid=ef, gate_fid=gf,
-                                meas_fid=mf, state_kind=kind, trial_idx=i,
-                                seed_base=seed_base))
+                                meas_fid=mf, loss_rate=lr, state_kind=kind,
+                                trial_idx=i, seed_base=seed_base))
     return jobs
 
 
@@ -706,7 +810,7 @@ def job_key(j):
     # varies gate_fid, so a key without it collapses every gate point onto one
     # another -- resume would skip work that was never done.
     return (j["arm"], f'{j["ent_fid"]:.6g}', f'{j["gate_fid"]:.6g}',
-            j["state_kind"], j["trial_idx"])
+            f'{j.get("loss_rate", 0.0):.6g}', j["state_kind"], j["trial_idx"])
 
 
 def load_done(path):
@@ -717,6 +821,7 @@ def load_done(path):
         for r in csv.DictReader(f):
             done.add((r["arm"], f'{float(r["ent_fid"]):.6g}',
                       f'{float(r["gate_fid"]):.6g}',
+                      f'{float(r.get("loss_rate") or 0.0):.6g}',
                       r["state_kind"], int(r["trial_idx"])))
     return done
 
@@ -942,18 +1047,24 @@ def preflight(base_cfg):
     if dead:
         print(f"    FAIL - {' and '.join(dead)} changes nothing even at 0.5.")
         if GATE_NOISE_MODE == "native":
-            print("           Expected on ket_vector: those parameters are only")
-            print("           read by the _bds swapping/purification paths, and")
-            print("           you run neither. Set GATE_NOISE_MODE='injected'")
-            print("           to model it, or drop to gate=meas=1.0 and scope")
-            print("           it out of the report.")
-        print("           Not the cheat-swap: with adjacent nodes there is no")
-        print("           entanglement swap, so that revert cannot show here.")
-        print("           The parameter is stored on QTCPNode but never reaches")
-        print("           the data path. Until it is wired in, the realistic")
-        print("           arm is identical to the ideal arm and metrics 1/3/4/5")
-        print("           carry no gate/measurement realism at all.")
-        ok = False
+            print("           EXPECTED on ket_vector: those parameters are read")
+            print("           only by the _bds swapping/purification paths, and")
+            print("           you run neither. Not the cheat-swap -- with")
+            print("           adjacent nodes there is no swap to reach. Set")
+            print("           GATE_NOISE_MODE='injected' to model it, or use")
+            print("           gate=meas=1.0 and scope it out of the report.")
+        else:
+            print("           UNEXPECTED with injection on. The injector is not")
+            print("           reaching the data path -- check that it installs")
+            print("           before the counters wrap run_circuit, and that")
+            print("           run_circuit is what the protocol actually calls.")
+        if dead == ["measurement_fidelity"]:
+            print("           NOTE: measurement-only failure is harmless here.")
+            print("           REALISTIC_MEAS_FID is 1.0, so no arm uses it. It")
+            print("           means run_circuit does not return measurement")
+            print("           outcomes as a dict of ints. Do not chase it.")
+        else:
+            ok = False
     else:
         print("    ok - both are live")
 
@@ -1028,14 +1139,17 @@ def main():
             print("are resolved -- a flat curve here is the classic silent bug.\n")
         ent_fids, n_rand, n_fixed = PILOT_ENT_FIDS, PILOT_N, PILOT_N_FIXED
         gsweep = PILOT_GATE_FIDS
+        lsweep = PILOT_LOSS_RATES
         tag = "pilot"
     else:
         ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
         gsweep = GATE_SWEEP_FIDS
+        lsweep = LOSS_SWEEP_RATES
         tag = "full"
 
     out = args.out or os.path.join(OUT_DIR, f"trials_{tag}.csv")
-    jobs = make_jobs(ent_fids, n_rand, n_fixed, gate_sweep=gsweep)
+    jobs = make_jobs(ent_fids, n_rand, n_fixed, gate_sweep=gsweep,
+                     loss_sweep=lsweep)
     done = load_done(out)
     todo = [j for j in jobs if job_key(j) not in done]
 
@@ -1047,7 +1161,44 @@ def main():
         summarise(out)
         return
 
+    # Refuse to append to a CSV whose header does not match ROW_FIELDS.
+    #
+    # DictWriter writes values in ROW_FIELDS order regardless of what header is
+    # already in the file, and only writes a header when the file is new. So
+    # appending to a CSV from an older schema silently shifts every new row
+    # relative to its own header -- loss_rate lands under state_kind, and so on
+    # down the line. load_done will not object either: missing columns read as
+    # defaults and the rows look already-done. The result is a file that parses
+    # cleanly and is entirely wrong.
+    #
+    # This has now bitten three times (recursion_depth_max -> max_packet_id, the
+    # unpatched injector, and the loss_rate insertion). Fail loudly instead.
     fresh = not os.path.exists(out)
+    if not fresh:
+        with open(out, newline="") as _f:
+            existing = next(csv.reader(_f), None)
+        if existing != ROW_FIELDS:
+            missing = [c for c in ROW_FIELDS if c not in (existing or [])]
+            extra = [c for c in (existing or []) if c not in ROW_FIELDS]
+            print("\n" + "!" * 70)
+            print("REFUSING TO APPEND -- header does not match ROW_FIELDS")
+            print("!" * 70)
+            print(f"  file: {out}")
+            if missing:
+                print(f"  columns the file is MISSING : {missing}")
+            if extra:
+                print(f"  columns the file has EXTRA  : {extra}")
+            if not missing and not extra:
+                print("  same columns, different ORDER -- equally fatal")
+            print()
+            print("  That file was written by an older version of this script.")
+            print("  Appending would shift every new row against the old header,")
+            print("  and resume would mark stale rows as done. Both silently.")
+            print()
+            print("  Move it aside and rerun:")
+            print(f"    mv {out} {out}.old")
+            sys.exit(2)
+
     fh = open(out, "a", newline="")
     w = csv.DictWriter(fh, fieldnames=ROW_FIELDS, extrasaction="ignore")
     if fresh:
@@ -1116,29 +1267,30 @@ def summarise(path):
     print("\n" + "=" * 78)
     print("SUCCESS RATE (Clopper-Pearson, alpha=0.05) -- random-state trials")
     print("=" * 78)
-    print(f'{"arm":10} {"ent_fid":>8} {"gate_fid":>9} {"n":>7} {"success":>9} '
-          f'{"95% CI":>18} {"mean F":>8} {"send us":>9}')
+    print(f'{"arm":10} {"ent_fid":>8} {"gate_fid":>9} {"loss":>6} {"n":>6} '
+          f'{"success":>8} {"95% CI":>18} {"mean F":>8} {"send us":>8}')
 
     groups = {}
     for r in rows:
         if r["state_kind"] != "random":
             continue
         groups.setdefault((r["arm"], float(r["ent_fid"]),
-                           float(r["gate_fid"])), []).append(r)
+                           float(r["gate_fid"]),
+                           float(r.get("loss_rate") or 0.0)), []).append(r)
 
-    for (arm, ef, gf) in sorted(groups, key=lambda x: (x[0], -x[1], -x[2])):
-        g = groups[(arm, ef, gf)]
+    for (arm, ef, gf, lr) in sorted(groups, key=lambda x: (x[0], -x[1], -x[2], x[3])):
+        g = groups[(arm, ef, gf, lr)]
         n = len(g)
         k = sum(int(x["delivered"]) for x in g)
         lo, hi = clopper_pearson(k, n)
         fs = [float(x["fidelity"]) for x in g
               if x["fidelity"] not in ("", "nan")]
         st = [float(x["send_time_us"]) for x in g if x["send_time_us"] != ""]
-        print(f"{arm:10} {ef:8.3f} {gf:9.5f} {n:7d} {k/n:9.4f} "
+        print(f"{arm:10} {ef:8.3f} {gf:9.5f} {lr:6.2f} {n:6d} {k/n:8.4f} "
               f"[{lo:.4f},{hi:.4f}] {np.mean(fs) if fs else float('nan'):8.4f} "
-              f"{np.mean(st) if st else float('nan'):9.1f}")
+              f"{np.mean(st) if st else float('nan'):8.1f}")
         if k == n:
-            print(f'{"":10} {"":8} {"":9} zero failures -> success rate >= {lo:.4f} '
+            print(f'{"":10} {"":8} {"":9} {"":6} zero failures -> rate >= {lo:.4f} '
                   f"(one-sided; the point estimate of 1.000 is not a "
                   f"zero-uncertainty result)")
 
@@ -1177,6 +1329,35 @@ def summarise(path):
     print("  cv ~ 0 means the counter is deterministic and needs no extra N.")
     print("  Metrics 3 and 4 are cost per DELIVERED qubit -- divide these by the")
     print("  delivered count per point; the summary records ingredients only.")
+
+    # Recovery machinery. Under zero loss these are all pinned -- restart_count
+    # 0 and n_transfers exactly 15 -- because nothing is ever detected as
+    # failed. If they are STILL pinned under loss, the loss patch is not
+    # reaching the fire path and the loss arm measures nothing.
+    lossy = [r for r in rows if float(r.get("loss_rate") or 0.0) > 0]
+    if lossy:
+        print("\n" + "=" * 78)
+        print("RECOVERY UNDER LOSS (does the protocol's own machinery fire?)")
+        print("=" * 78)
+        print(f'{"loss":>6} {"n":>6} {"success":>8} {"n_transfers":>12} '
+              f'{"restarts":>9} {"loss_events":>12} {"send us":>9}')
+        by = {}
+        for r in lossy:
+            if r["state_kind"] == "random":
+                by.setdefault(float(r["loss_rate"]), []).append(r)
+        for lr in sorted(by):
+            g = by[lr]
+            f = lambda k: np.mean([float(x[k]) for x in g if x.get(k) not in ("", None)])
+            print(f'{lr:6.2f} {len(g):6d} '
+                  f'{np.mean([int(x["delivered"]) for x in g]):8.4f} '
+                  f'{f("n_transfers"):12.1f} {f("restart_count"):9.2f} '
+                  f'{f("loss_events"):12.1f} {f("send_time_us"):9.1f}')
+        base = by.get(min(by), [])
+        if base and abs(np.mean([float(x["n_transfers"]) for x in base]) - 15.0) < 0.01:
+            pass
+        print("  n_transfers was EXACTLY 15.0 on every loss-free trial. If it")
+        print("  stays 15.0 here, send-until-3 is not firing -- the patch is")
+        print("  in the wrong place and the arm is measuring nothing.")
 
     # metric-5 tail check
     st = [float(r["send_time_us"]) for r in rows if r["send_time_us"] != ""]
