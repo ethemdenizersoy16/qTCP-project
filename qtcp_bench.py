@@ -33,6 +33,9 @@ seconds rather than silently three hours in:
       actually reaches the swap.
   A5  one entry in transfer.metrics == one teleportation == one entangled pair.
   A6  get_received_packet returns a 2-amplitude vector for a delivered qubit.
+
+This addition is for git to not ignore the file
+
 """
 
 import argparse
