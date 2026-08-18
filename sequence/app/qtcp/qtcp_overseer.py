@@ -1172,7 +1172,14 @@ class QTCPOverseer:
         if any(r.state is BobState.CONSUMED for r in records):
             return  # already reconstructed
         arrived = [r for r in records if r.state is BobState.ARRIVED]
-        if len(arrived) < qss.K_THRESHOLD:
+                # QEC leaves need the FULL codeword (correction mode); QSS nodes need
+        # only K (erasure mode). Discriminate the same way _reconstruct_packet
+        # does, so a partially-arrived QEC leaf is declared unrecoverable here
+        # rather than being sent to reconstruct and tripping its full-codeword
+        # assertion.
+        is_qec_layer = any(getattr(r, "is_qec_layer", False) for r in records)
+        required = qss.N_SHARES if is_qec_layer else qss.K_THRESHOLD
+        if len(arrived) < required:
             log.logger.warning(
                 f"QTCPOverseer: packet {packet_id} from {src} settled with only "
                 f"{len(arrived)}/{qss.N_SHARES} shares; cannot reconstruct"
