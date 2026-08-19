@@ -155,6 +155,27 @@ LOSS_SWEEP_RATES = [0.0, 0.01, 0.02, 0.03, 0.05, 0.08,
 # Loss for the non-loss arms. Keep at 0.0 -- teleportation has no data-path loss.
 BASE_LOSS = 0.0
 
+# MIXED ARM: both failure modes present at once.
+#
+# THIS IS THE ONLY ARM THAT CAN SEPARATE v2.0 FROM v2.1. Everywhere else the
+# versions are identical by construction:
+#   - corruption arms run at loss=0   -> no erasures  -> e=0 always
+#                                     -> fail-stop never fires, e=1 tables unused
+#   - the loss arm runs at ent/gate=1 -> no errors    -> nothing for step 2 to
+#                                        detect; 2.0 and 2.1 give the same
+#                                        success rate, differing only in
+#                                        n_transfers.
+# Step 2 engages only when an erasure and an error land in the SAME leaf, which
+# requires both knobs non-zero simultaneously.
+#
+# ent_fid stays >= 0.96: above eps ~ 0.04 no version beats bare teleportation,
+# so points below that are just measuring zero at both ends.
+MIXED_ENT_FIDS = [0.99, 0.98, 0.97]
+MIXED_LOSS_RATES = [0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50]
+
+PILOT_MIXED_ENT = [0.99, 0.97]
+PILOT_MIXED_LOSS = [0.0, 0.10, 0.30]
+
 FULL_N = 2000              # random-state trials per point
 FULL_N_FIXED = 400         # fixed-state trials per point
 
@@ -798,13 +819,16 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
 # WORK PLAN
 # ----------------------------------------------------------------------------
 
-def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None):
+def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
+              mixed=None):
     """Work plan as a list of arms.
 
     ideal      gate/meas perfect, ent-gen swept  -> metric 2 (QPing knee)
     realistic  gate 0.999, ent-gen swept         -> metrics 1, 3, 4, 5
     gatesweep  ent-gen perfect, gate swept       -> hardware requirement figure
     losssweep  everything perfect, loss swept    -> the regime qTCP is FOR
+    mixed      ent-gen AND loss both swept       -> the only arm where step 2
+                                                   is observable
     """
     arms = [
         dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
@@ -818,6 +842,10 @@ def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None):
     if loss_sweep:
         arms.append(dict(name="losssweep", ent_fids=[1.0], gate_fids=[1.0],
                          meas_fids=[1.0], losses=loss_sweep))
+    if mixed:
+        m_ent, m_loss = mixed
+        arms.append(dict(name="mixed", ent_fids=m_ent, gate_fids=[1.0],
+                         meas_fids=[1.0], losses=m_loss))
 
     # seed_base is unique BY CONSTRUCTION, not by luck. Drawing ~100k random
     # 31-bit seeds gives ~2 expected birthday collisions, and a collision means
@@ -1183,16 +1211,18 @@ def main():
         ent_fids, n_rand, n_fixed = PILOT_ENT_FIDS, PILOT_N, PILOT_N_FIXED
         gsweep = PILOT_GATE_FIDS
         lsweep = PILOT_LOSS_RATES
+        mix = (PILOT_MIXED_ENT, PILOT_MIXED_LOSS)
         tag = "pilot"
     else:
         ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
         gsweep = GATE_SWEEP_FIDS
         lsweep = LOSS_SWEEP_RATES
+        mix = (MIXED_ENT_FIDS, MIXED_LOSS_RATES)
         tag = "full"
 
     out = args.out or os.path.join(OUT_DIR, f"trials_{tag}.csv")
     jobs = make_jobs(ent_fids, n_rand, n_fixed, gate_sweep=gsweep,
-                     loss_sweep=lsweep)
+                     loss_sweep=lsweep, mixed=mix)
     done = load_done(out)
     todo = [j for j in jobs if job_key(j) not in done]
 
@@ -1411,6 +1441,33 @@ def summarise(path):
         print("  n_transfers was EXACTLY 15.0 on every loss-free trial. If it")
         print("  stays 15.0 here, send-until-3 is not firing -- the patch is")
         print("  in the wrong place and the arm is measuring nothing.")
+
+    # Mixed arm as a 2D grid -- reading it as a flat list hides the shape,
+    # and the tolerance boundary is the whole point.
+    mx = [r for r in rows if r["arm"] == "mixed" and r["state_kind"] == "random"]
+    if mx:
+        print("\n" + "=" * 78)
+        print("MIXED ARM: success rate, ent_fid (rows) x loss (cols)")
+        print("=" * 78)
+        ents = sorted({float(r["ent_fid"]) for r in mx}, reverse=True)
+        lrs = sorted({float(r["loss_rate"]) for r in mx})
+        print(f'{"ent_fid":>8} ' + " ".join(f'{l:>7.2f}' for l in lrs))
+        for ef in ents:
+            cells = []
+            for lr in lrs:
+                g = [r for r in mx if float(r["ent_fid"]) == ef
+                     and float(r["loss_rate"]) == lr]
+                cells.append(f'{np.mean([int(x["delivered"]) for x in g]):7.3f}'
+                             if g else f'{"-":>7}')
+            print(f'{ef:8.3f} ' + " ".join(cells))
+        print()
+        print(f'{"":8} ' + " ".join(f'{(1-l):>7.3f}' for l in lrs)
+              + "   <- bare qubit, for comparison")
+        print()
+        print("  A cell beats bare teleportation when it exceeds "
+              "(1-loss)*ent_fid.")
+        print("  This is the ONLY arm where v2.0 and v2.1 differ -- elsewhere")
+        print("  the versions are identical by construction.")
 
     # metric-5 tail check
     st = [float(r["send_time_us"]) for r in rows if r["send_time_us"] != ""]
