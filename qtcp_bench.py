@@ -115,21 +115,25 @@ PILOT_N_FIXED = 30      # exercise the fixed-state path too
 # -- it only works because of the injector, and its resume key differs from the
 # other two. Leaving it untested until the full run is the wrong risk.
 PILOT_GATE_FIDS = [1.0, 0.999, 0.99]
-PILOT_LOSS_RATES = [0.0, 0.30, 0.50, 0.70]
+PILOT_LOSS_RATES = [0.0, 0.02, 0.05, 0.30]
 
 # FULL grid, revised from preflight: check [2] gave success 1.00 / 0.75 / 0.25
 # at ent_fid 1.00 / 0.90 / 0.70, so the knee sits near 0.80. Points are dense
 # through 0.75-0.95 where the curve actually moves, and QARQ-TP's published
 # 0.988 / 0.979 / 0.962 are kept as cross-protocol anchors.
+# 0.60/0.55 added: the pilot still showed 0.35 success at 0.70, so the curve
+# had not bottomed out and the figure would have ended mid-fall.
 FULL_ENT_FIDS = [1.0, 0.988, 0.979, 0.962, 0.95, 0.92, 0.90, 0.88,
-                 0.86, 0.84, 0.82, 0.80, 0.78, 0.75, 0.70, 0.65]
+                 0.86, 0.84, 0.82, 0.80, 0.78, 0.75, 0.70, 0.65, 0.60, 0.55]
 
 # Gate-fidelity sweep, run at PERFECT entanglement so the hardware requirement
 # is isolated from the channel. This answers a limitation the source paper
 # states but never quantifies: qTCP "requires low error rate of transmission,
 # that is, it is more challenging in the hardware". The transition lives
 # between ~0.997 and ~0.9999.
-GATE_SWEEP_FIDS = [1.0, 0.99999, 0.9999, 0.9995, 0.999, 0.998, 0.997, 0.995]
+# Pilot put half-success near 0.9975. 0.99999 dropped -- it and 0.9999 both
+# read 1.000; 0.993 added below the knee instead.
+GATE_SWEEP_FIDS = [1.0, 0.9999, 0.9995, 0.999, 0.998, 0.997, 0.995, 0.993]
 
 # Per-transfer loss sweep, run at PERFECT entanglement and PERFECT gates so the
 # erasure behaviour is isolated from corruption.
@@ -141,8 +145,12 @@ GATE_SWEEP_FIDS = [1.0, 0.99999, 0.9999, 0.9995, 0.999, 0.998, 0.997, 0.995]
 #
 # Predicted break-even against bare teleportation at MAX_DEPTH=1: loss ~0.50
 # without the restart, ~0.58 with RESTART_AMOUNT=1. Grid brackets both.
-LOSS_SWEEP_RATES = [0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.45,
-                    0.50, 0.55, 0.60, 0.70]
+# Spans BOTH protocol versions. Fail-stop breaks even near 0.036, so the low
+# end must be dense; erasure-aware leaves break even near 0.500, so the grid
+# must also reach that far or the improved version shows no knee at all and the
+# two runs cannot be plotted on the same axis.
+LOSS_SWEEP_RATES = [0.0, 0.01, 0.02, 0.03, 0.05, 0.08,
+                    0.12, 0.20, 0.30, 0.40, 0.50, 0.60]
 
 # Loss for the non-loss arms. Keep at 0.0 -- teleportation has no data-path loss.
 BASE_LOSS = 0.0
@@ -157,6 +165,36 @@ FIXED_STATES = {
 }
 # All three, so no Pauli is invisible: Z is undetectable on |0>, X on |+>.
 
+def _code_version():
+    """Stamp every row with the code that produced it.
+
+    Two runs in this project were silently ruined by a stale script -- rows
+    written by an older version, indistinguishable from new ones. A git hash
+    (or a source digest if git is unavailable) makes that detectable instead of
+    invisible. If a CSV ever contains two values in this column, the run mixed
+    versions and the comparison is void.
+    """
+    import subprocess, hashlib, glob
+    try:
+        h = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                    stderr=subprocess.DEVNULL, timeout=5)
+        dirty = subprocess.check_output(["git", "status", "--porcelain"],
+                                        stderr=subprocess.DEVNULL, timeout=5)
+        return h.decode().strip() + ("-dirty" if dirty.strip() else "")
+    except Exception:
+        pass
+    try:
+        d = hashlib.sha1()
+        for f in sorted(glob.glob("sequence/app/qtcp/*.py") + [__file__]):
+            with open(f, "rb") as fh:
+                d.update(fh.read())
+        return "sha1:" + d.hexdigest()[:10]
+    except Exception:
+        return "unknown"
+
+
+CODE_VERSION = _code_version()
+
 MASTER_SEED = 20260817
 OUT_DIR = "/tmp/qtcp_bench"
 
@@ -168,10 +206,10 @@ ROW_FIELDS = [
     "ent_pairs_consumed", "classical_msgs", "classical_msgs_total",
     "gate_count", "gate_count_total",
     "qubits_used", "memory_slot_time_us",
-    "longest_share_us", "max_packet_id", "restart_count", "n_transfers",
+    "longest_share_us", "max_packet_id", "failed_transfers", "n_transfers",
     "paulis_injected", "meas_flips", "loss_events", "fire_attempts",
     "psi_sent", "psi_recv",
-    "seed_base", "wall_s", "error",
+    "seed_base", "code_version", "wall_s", "error",
 ]
 
 
@@ -605,7 +643,8 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
     row = {f: "" for f in ROW_FIELDS}
     row.update(arm=arm, ent_fid=ent_fid, gate_fid=gate_fid, meas_fid=meas_fid,
                loss_rate=loss_rate, state_kind=state_kind,
-               trial_idx=trial_idx, seed_base=seed_base)
+               trial_idx=trial_idx, seed_base=seed_base,
+               code_version=CODE_VERSION)
 
     counters = TrialCounters()
     injector = None
@@ -723,8 +762,12 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
             qubits_used=counters.peak_slots(),
             memory_slot_time_us=round(counters.slot_time_us(), 3),
             max_packet_id=counters.max_packet_id(),
-            restart_count=sum(1 for _, _, s, _ in counters.finishes
-                              if s == "FAILED"),
+            # NOT a restart count -- this is the number of transfers that
+            # finished FAILED. Under loss it tracks loss_events, not
+            # protocol-level restarts. Naming it restart_count invited exactly
+            # that misreading.
+            failed_transfers=sum(1 for _, _, s, _ in counters.finishes
+                                 if s == "FAILED"),
             n_transfers=len(counters.finishes),
             paulis_injected=(injector.paulis_applied if injector else 0),
             meas_flips=(injector.meas_flips if injector else 0),
@@ -1264,6 +1307,16 @@ def summarise(path):
         print("no usable rows")
         return
 
+    vers = {r.get("code_version", "") for r in rows}
+    if len(vers) > 1:
+        print("\n" + "!" * 72)
+        print("MIXED CODE VERSIONS IN THIS FILE -- the run is not comparable")
+        for v in sorted(vers):
+            print(f"    {v}: {sum(1 for r in rows if r.get('code_version')==v):,} rows")
+        print("!" * 72)
+    elif vers:
+        print(f"\ncode version: {vers.pop()}")
+
     print("\n" + "=" * 78)
     print("SUCCESS RATE (Clopper-Pearson, alpha=0.05) -- random-state trials")
     print("=" * 78)
@@ -1340,7 +1393,7 @@ def summarise(path):
         print("RECOVERY UNDER LOSS (does the protocol's own machinery fire?)")
         print("=" * 78)
         print(f'{"loss":>6} {"n":>6} {"success":>8} {"n_transfers":>12} '
-              f'{"restarts":>9} {"loss_events":>12} {"send us":>9}')
+              f'{"failed_tx":>9} {"loss_events":>12} {"send us":>9}')
         by = {}
         for r in lossy:
             if r["state_kind"] == "random":
@@ -1350,7 +1403,7 @@ def summarise(path):
             f = lambda k: np.mean([float(x[k]) for x in g if x.get(k) not in ("", None)])
             print(f'{lr:6.2f} {len(g):6d} '
                   f'{np.mean([int(x["delivered"]) for x in g]):8.4f} '
-                  f'{f("n_transfers"):12.1f} {f("restart_count"):9.2f} '
+                  f'{f("n_transfers"):12.1f} {f("failed_transfers"):9.2f} '
                   f'{f("loss_events"):12.1f} {f("send_time_us"):9.1f}')
         base = by.get(min(by), [])
         if base and abs(np.mean([float(x["n_transfers"]) for x in base]) - 15.0) < 0.01:
