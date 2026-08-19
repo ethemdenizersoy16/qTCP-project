@@ -558,45 +558,86 @@ class QTCPOverseer:
     def _advance_qec_packet(self, packet_id: int) -> None:
         """Drive a QEC leaf block forward after one of its physical shares
         resolves (from on_alice_transfer_finished).
-        Fail-stop: any FAILED share => the whole leaf is LOST (correction needs
-        all N_SHARES). Otherwise, once all N_SHARES are DELIVERED, Alice's side
-        of the leaf is done -- finalize (which cascades to the parent QSS share)
-        and let Bob correction-decode his aggregation independently. Until then,
-        fire the next share.
-        The IN_PROGRESS guard here is load-bearing: this is the entry point
-        from a terminal event, and the leaf may already have been finalized by
-        a window-close teardown before this fires.
+
+        Dynamic (erasure-aware) leaf: a FAILED share is NO LONGER fatal on its
+        own. The leaf keeps firing its remaining HELD shares and stays alive as
+        long as it can still put K_THRESHOLD shares at Bob. Terminal decisions:
+          - optimistic ceiling (delivered + held + in_flight) < K_THRESHOLD
+            -> LOST. Even if every still-uncertain share delivered, Bob could
+            not reach K, so the leaf cannot erasure-decode. Cascades to the
+            parent QSS share as an erasure (the whole point: a lost leaf becomes
+            one outer erasure, it does not discard the outer loss budget).
+          - all N_SHARES resolved (nothing HELD, nothing IN_FLIGHT) and
+            delivered >= K_THRESHOLD -> finalize DELIVERED. Alice's side of the
+            leaf is done; Bob decodes by arrival count (N -> correction,
+            K/K+1 -> erasure) on his side.
+          - otherwise (still shares to fire) -> fire the next one. We fire ALL
+            N_SHARES, never stopping early at K, so the no-loss case gives Bob a
+            full codeword to correction-decode.
+
+        The IN_PROGRESS guard is load-bearing: entry point from a terminal
+        event; the leaf may already have been finalized by a window-close
+        teardown before this fires.
         """
         record = self.packets[packet_id]
         if record.outcome is not PacketOutcome.IN_PROGRESS:
             return
- 
-        # Any failed share is fatal in correction mode.
-        if any(s is ShareStatus.FAILED for s in record.share_status):
+
+        delivered = sum(1 for s in record.share_status
+                        if s is ShareStatus.DELIVERED)
+        held = sum(1 for s in record.share_status
+                   if s is ShareStatus.HELD)
+        in_flight = sum(1 for s in record.share_status
+                        if s is ShareStatus.IN_FLIGHT)
+        loss_seen = any(s is ShareStatus.FAILED for s in record.share_status)
+
+        # Can Bob still reach K if everything uncertain delivered? If not the
+        # leaf cannot decode at all -> LOST (cascades to the parent QSS share
+        # as one erasure).
+        if delivered + held + in_flight < qss.K_THRESHOLD:
             log.logger.warning(
-                f"QTCPOverseer: QEC packet {packet_id} has a failed share; "
-                f"correction mode needs all {qss.N_SHARES} -> LOST (fail-stop)"
+                f"QTCPOverseer: QEC leaf {packet_id} can no longer reach "
+                f"K={qss.K_THRESHOLD} (delivered={delivered}, held={held}, "
+                f"in_flight={in_flight}) -> LOST"
             )
             self._finalize_lost(record)
             return
- 
-        delivered = sum(1 for s in record.share_status
-                        if s is ShareStatus.DELIVERED)
-        if delivered == qss.N_SHARES:
-            # All physical shares are on Bob's side. Alice's side of this leaf
-            # is done; finalize (which cascades to the parent QSS share via
-            # _finalize_delivered, un-sticking the next leaf). Bob correction-
-            # decodes his aggregation independently and feeds the recovered
-            # qubit up his own aggregation.
-            log.logger.info(
-                f"QTCPOverseer: QEC leaf {packet_id} all {qss.N_SHARES} shares "
-                f"sent; finalizing (Bob correction-decodes on his side)"
-            )
-            self._finalize_delivered(record)
+
+        # QEC until a loss is seen: no loss -> send all N so Bob gets a full
+        # codeword. Loss seen -> QSS mode, stop once K are delivered.
+        if loss_seen:
+            if delivered >= qss.K_THRESHOLD:
+                log.logger.info(
+                    f"QTCPOverseer: QEC leaf {packet_id} loss seen, "
+                    f"{delivered}/{qss.N_SHARES} delivered (>= K); finalizing "
+                    f"(Bob erasure-decodes)"
+                )
+                self._finalize_delivered(record)
+                return
+        else:
+            if delivered == qss.N_SHARES:
+                log.logger.info(
+                    f"QTCPOverseer: QEC leaf {packet_id} all {qss.N_SHARES} "
+                    f"delivered, no loss; finalizing (Bob correction-decodes)"
+                )
+                self._finalize_delivered(record)
+                return
+        if (delivered == 0 and in_flight == 0
+                and delivered + held <= qss.K_THRESHOLD
+                and any(s is ShareStatus.FAILED for s in record.share_status)
+                and record.restarts < self.max_restarts):
+            self._restart_packet_locally(record)
+            self._fire_next_qec_share(record)
             return
- 
-        # Not done, none failed -> start the next share.
-        self._fire_next_qec_share(record)
+        # Still shares to send.
+        if held > 0 or in_flight > 0:
+            self._fire_next_qec_share(record)
+            return
+
+        # Nothing left to send and neither terminal condition hit: everything
+        # resolved with K <= delivered < N under a loss, or delivered < K which
+        # the ceiling check already caught. Finalize.
+        self._finalize_delivered(record)
     def get_packet_outcome(self, packet_id: int) -> PacketOutcome | None:
         """Poll for terminal outcome. None if the packet id is unknown."""
         record = self.packets.get(packet_id)
@@ -681,16 +722,26 @@ class QTCPOverseer:
                         if s is ShareStatus.IN_FLIGHT)
         recursing = sum(1 for s in record.share_status
                         if s is ShareStatus.RECURSING)
-        if delivered >= qss.K_THRESHOLD:
-            self._finalize_delivered(record)
-            return
-        # Optimistic upper bound: if every uncertain share (held, in_flight,
+                # Optimistic upper bound: if every uncertain share (held, in_flight,
         # or recursing) resolved as DELIVERED, could we still reach K? If not,
         # the packet is unrecoverable.
         if delivered + held + in_flight + recursing < qss.K_THRESHOLD:
             self._finalize_lost(record)
             return
+        # QEC until a loss is seen. No loss -> keep going until all N_SHARES
+        # are delivered, so Bob correction-decodes a full codeword. Once any
+        # share has FAILED we are in QSS mode -- K delivered is enough.
+        loss_seen = any(s is ShareStatus.FAILED for s in record.share_status)
+        if loss_seen:
+            if delivered >= qss.K_THRESHOLD:
+                self._finalize_delivered(record)
+                return
+        else:
+            if delivered == qss.N_SHARES:
+                self._finalize_delivered(record)
+                return
         self._fire_shares(packet_id)
+
     def _fire_shares(self, packet_id: int) -> None:
         """Fire (or recurse into) held shares up to the parallelism cap and
         the goal cap, in share_index order.
@@ -729,8 +780,15 @@ class QTCPOverseer:
                 return
             if in_flight >= self._MAX_IN_FLIGHT:
                 return
-            if delivered + in_flight >= qss.K_THRESHOLD:
+
+            # QEC until a loss is seen: fire ALL N_SHARES so a lossless packet
+            # gives Bob a full codeword to correction-decode. Once any share
+            # has FAILED we are in QSS mode -- stop once K are committed.
+            loss_seen = any(s is ShareStatus.FAILED
+                            for s in record.share_status)
+            if loss_seen and delivered + in_flight >= qss.K_THRESHOLD:
                 return
+
             held_indices = [i for i, s in enumerate(record.share_status)
                             if s is ShareStatus.HELD]
             if not held_indices:
@@ -766,10 +824,13 @@ class QTCPOverseer:
         held = sum(1 for s in record.share_status
                    if s is ShareStatus.HELD)
         slot = record.share_slots[share_index]
+
         if delivered + held > qss.K_THRESHOLD:
             # safe to lose this share directly; deliver as a QEC leaf block.
             self._fire_leaf(record, share_index, slot)
             return True
+        
+    
         # delivered + held <= K_THRESHOLD: recursion territory.
         # delivered == 0 in recursion territory: every fired share died and
         # Bob holds nothing. Nothing of value has left Alice -- she still
@@ -825,10 +886,17 @@ class QTCPOverseer:
         # Depth cap reached: recursion would exceed the memory budget. Deliver
         # as a QEC leaf instead; if it fails, the packet just loses at this
         # level and cascades upward.
-        if record.depth >= self.max_recursion_depth - 1:
+                # LEAF CHECK: a share is a leaf if there is no recursion to be done on
+        # it -- either this packet is itself a QEC leaf block, or we are at the
+        # depth cap so this share is meant to be sent, not recursed into.
+        # Leaves are never recursed on. This sits AFTER the delivered == 0
+        # restart branch: local restart is independent of depth/leaf status and
+        # keeps first refusal.
+        if (record.is_qec_layer
+                or record.depth >= self.max_recursion_depth - 1):
             log.logger.info(
                 f"QTCPOverseer: packet {record.packet_id} share {share_index} "
-                f"at max QSS depth {record.depth}; delivering as QEC leaf block "
+                f"is a leaf (depth {record.depth}); firing directly "
                 f"(delivered={delivered}, held={held})"
             )
             self._fire_leaf(record, share_index, slot)
@@ -914,6 +982,8 @@ class QTCPOverseer:
         # with zero arrivals and purges. Under histories where Bob holds
         # something, the ARRIVED branch of _on_cancel frees his slots.
         for share_index in range(qss.N_SHARES):
+            if share_index in failed_positions:
+                continue
             tid = self.app.mint_transfer_id()
             self.app.node.send_message(
                 record.dst,
@@ -1172,14 +1242,8 @@ class QTCPOverseer:
         if any(r.state is BobState.CONSUMED for r in records):
             return  # already reconstructed
         arrived = [r for r in records if r.state is BobState.ARRIVED]
-                # QEC leaves need the FULL codeword (correction mode); QSS nodes need
-        # only K (erasure mode). Discriminate the same way _reconstruct_packet
-        # does, so a partially-arrived QEC leaf is declared unrecoverable here
-        # rather than being sent to reconstruct and tripping its full-codeword
-        # assertion.
-        is_qec_layer = any(getattr(r, "is_qec_layer", False) for r in records)
-        required = qss.N_SHARES if is_qec_layer else qss.K_THRESHOLD
-        if len(arrived) < required:
+
+        if len(arrived) < qss.K_THRESHOLD:
             log.logger.warning(
                 f"QTCPOverseer: packet {packet_id} from {src} settled with only "
                 f"{len(arrived)}/{qss.N_SHARES} shares; cannot reconstruct"
@@ -1229,44 +1293,52 @@ class QTCPOverseer:
             (r for r in records if r.state is BobState.ARRIVED),
             key=lambda r: r.share_index,
         )
-        used = arrived
-        used_positions = [r.share_index for r in used]
-        used_slots = [r.data_index for r in used]
- 
-        # Correction mode iff these records are a QEC leaf block. The leaf's
-        # shares carry is_qec_layer=True (threaded from Alice via SEND_NOTICE);
-        # QSS nodes (including the parent-None root) carry False.
-        is_qec_layer = any(getattr(r, "is_qec_layer", False) for r in records)
- 
-        if is_qec_layer:
-            # Correction mode needs the FULL codeword: all N_SHARES arrived.
-            # The QEC layer guarantees this (fail-stop: it goes LOST on any
-            # failed share, so it only ever reconstructs with all N_SHARES).
-            # If we are correction-decoding with fewer, the QEC invariant broke
-            # upstream -- trip loudly rather than silently miscorrect a partial
-            # codeword.
-            assert len(arrived) == qss.N_SHARES, (
-                f"packet {packet_id}: correction-mode decode reached with "
-                f"{len(arrived)}/{qss.N_SHARES} arrived shares. A QEC-leaf "
-                f"packet must reconstruct with a full codeword. Either a "
-                f"non-QEC packet leaked in (discriminator broken) or the QEC "
-                f"fail-stop policy was bypassed."
-            )
+        n_arrived = len(arrived)
+        arrived_positions = [r.share_index for r in arrived]
+
+        if n_arrived == qss.N_SHARES:
+            # ---- QEC correction mode: full codeword present ----
+            # Every share made it; correct a single Pauli error and decode.
+            used_positions = arrived_positions
+            used_slots = [r.data_index for r in arrived]
             secret_slot = self._decode_corrected(
                 used_positions, used_slots,
                 desc=f"packet {packet_id} from {src}")
-        else:
-            # Erasure mode (unchanged): reconstruct from K, treat rest as erased.
-            assert len(arrived) == qss.K_THRESHOLD, (
-            f"packet {packet_id}: expected exactly K={qss.K_THRESHOLD} arrivals, "
-            f"got {len(arrived)} -- fire policy invariant (<=K arrivals) violated"
-        )
-            used_indices_set = set(used_positions)
-            erased = [i for i in range(qss.N_SHARES)
-                      if i not in used_indices_set]
+
+        elif n_arrived >= qss.K_THRESHOLD:
+            # ---- QSS erasure mode: reconstruct from exactly K survivors ----
+            # If more than K arrived (K+1 == 4 of 5), measure out the surplus
+            # survivor(s) FIRST so no live entanglement sits on an "erased"
+            # position, then treat those measured-out positions as erasures
+            # alongside the genuinely-non-arrived positions. Deterministic
+            # choice: keep the K lowest-index arrivals, drop the rest. This is
+            # the "drop to 3, decode as e=2" rule -- the erasure pair handed to
+            # _decode_at is (genuinely-lost position, measured-out surplus).
+            keep = arrived[:qss.K_THRESHOLD]
+            surplus = arrived[qss.K_THRESHOLD:]
+            for r in surplus:
+                # Measure the surplus survivor out of the joint state BEFORE
+                # decoding; decoding around a live share yields a joint state
+                # rather than the secret. Its slot returns to the pool.
+                self.app.free_data_slot(r.data_index)
+                r.data_index = None
+            used_positions = [r.share_index for r in keep]
+            used_slots = [r.data_index for r in keep]
+            kept_set = set(used_positions)
+            erased = [i for i in range(qss.N_SHARES) if i not in kept_set]
             secret_slot = self._decode_at(
                 used_positions, used_slots, erased,
-                desc=f"packet {packet_id} from {src} reconstructed")
+                desc=(f"packet {packet_id} from {src} reconstructed "
+                      f"(erasure, {n_arrived} arrived -> kept {used_positions})"))
+
+        else:
+            # Unreachable: _check_packet_complete only calls us with >= K
+            # arrivals. Trip loudly rather than decode garbage.
+            raise AssertionError(
+                f"packet {packet_id}: _reconstruct_packet reached with "
+                f"{n_arrived}/{qss.N_SHARES} arrived (< K={qss.K_THRESHOLD}). "
+                f"_check_packet_complete should have blocked this."
+            )
         for record in records:
             record.state = BobState.CONSUMED
             record.data_index = None
