@@ -1422,19 +1422,21 @@ def summarise(path):
         print("\n" + "=" * 78)
         print("RECOVERY UNDER LOSS (does the protocol's own machinery fire?)")
         print("=" * 78)
-        print(f'{"loss":>6} {"n":>6} {"success":>8} {"n_transfers":>12} '
-              f'{"failed_tx":>9} {"loss_events":>12} {"send us":>9}')
+        print(f'{"arm":10} {"ent_fid":>8} {"loss":>6} {"n":>6} {"success":>8} '
+              f'{"n_transf":>9} {"failed_tx":>9} {"loss_ev":>8} {"send us":>9}')
         by = {}
         for r in lossy:
             if r["state_kind"] == "random":
-                by.setdefault(float(r["loss_rate"]), []).append(r)
-        for lr in sorted(by):
-            g = by[lr]
+                by.setdefault((r["arm"], float(r["ent_fid"]),
+                               float(r["loss_rate"])), []).append(r)
+        for key in sorted(by):
+            arm, ef, lr = key
+            g = by[key]
             f = lambda k: np.mean([float(x[k]) for x in g if x.get(k) not in ("", None)])
-            print(f'{lr:6.2f} {len(g):6d} '
+            print(f'{arm:10} {ef:8.3f} {lr:6.2f} {len(g):6d} '
                   f'{np.mean([int(x["delivered"]) for x in g]):8.4f} '
-                  f'{f("n_transfers"):12.1f} {f("failed_transfers"):9.2f} '
-                  f'{f("loss_events"):12.1f} {f("send_time_us"):9.1f}')
+                  f'{f("n_transfers"):9.1f} {f("failed_transfers"):9.2f} '
+                  f'{f("loss_events"):8.1f} {f("send_time_us"):9.1f}')
         base = by.get(min(by), [])
         if base and abs(np.mean([float(x["n_transfers"]) for x in base]) - 15.0) < 0.01:
             pass
@@ -1461,11 +1463,23 @@ def summarise(path):
                              if g else f'{"-":>7}')
             print(f'{ef:8.3f} ' + " ".join(cells))
         print()
-        print(f'{"":8} ' + " ".join(f'{(1-l):>7.3f}' for l in lrs)
-              + "   <- bare qubit, for comparison")
+        print("MARGIN vs bare teleportation (qTCP - (1-loss)*ent_fid):")
+        print(f'{"ent_fid":>8} ' + " ".join(f'{l:>7.2f}' for l in lrs))
+        for ef in ents:
+            cells = []
+            for lr in lrs:
+                g = [r for r in mx if float(r["ent_fid"]) == ef
+                     and float(r["loss_rate"]) == lr]
+                if g:
+                    m = np.mean([int(x["delivered"]) for x in g]) - (1-lr)*ef
+                    cells.append(f'{m:+7.3f}')
+                else:
+                    cells.append(f'{"-":>7}')
+            print(f'{ef:8.3f} ' + " ".join(cells))
         print()
-        print("  A cell beats bare teleportation when it exceeds "
-              "(1-loss)*ent_fid.")
+        print("  Positive = beats sending the qubit bare. The baseline is")
+        print("  (1-loss)*ent_fid and varies BY ROW, so it cannot be a single")
+        print("  row of numbers -- printing the margin directly instead.")
         print("  This is the ONLY arm where v2.0 and v2.1 differ -- elsewhere")
         print("  the versions are identical by construction.")
 
