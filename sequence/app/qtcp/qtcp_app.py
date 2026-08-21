@@ -119,7 +119,7 @@ class QTCPApp:
         flight at once (if memory_size allows), so the reservation must cover
         all `num_qubits` peaking simultaneously: multiply.
         """
-        per_qubit = 4+ qss.N_SHARES + (qss.N_SHARES - 1) * self.max_recursion_depth
+        per_qubit = qss.N_SHARES + (qss.N_SHARES - 1) * self.max_recursion_depth
         return num_qubits * per_qubit
 
     # ------------------------------------------------------------------

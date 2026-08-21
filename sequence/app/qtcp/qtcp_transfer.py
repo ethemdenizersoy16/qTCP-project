@@ -924,7 +924,7 @@ class QTCPTransfer(RequestApp):
 
         log.logger.info(
             f"{self.name}: transfer {transfer.transfer_id} received, swapped into "
-            f"data memory {data_index}"
+            f"data memory {data_index}. Remaining data slots: {len(self.free_data_slots)}"
         )
 
         self.node.send_message(
