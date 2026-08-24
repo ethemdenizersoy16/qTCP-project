@@ -56,7 +56,8 @@ from sequence.app.qtcp.qtcp_transfer import (
     TransferStatus, BobState,
 )
 from sequence.utils import log
-
+from sequence.kernel.process import Process
+from sequence.kernel.event import Event
 
 class PacketOutcome(Enum):
     IN_PROGRESS       = auto()
@@ -729,7 +730,7 @@ class QTCPOverseer:
                 and loss_seen
                 and record.restarts < self.max_restarts):
             self._restart_packet_locally(record)
-            self._fire_next_leaf_share(record)
+            #self._fire_next_leaf_share(record)
             return
 
         # Still shares to send.
@@ -1136,6 +1137,20 @@ class QTCPOverseer:
                 ),
             )
         # Re-encode the recovered secret in place, same packet id.
+        # THE FIX: Freeze the packet so stragglers ignore it during the delay
+        record.share_slots = [None] * qss.N_SHARES
+        record.share_status = [ShareStatus.RECURSING] * qss.N_SHARES
+
+        # Inject wait before re-encoding
+        wait_time_ps = self.app.rto.get(record.dst, 1_000_000) 
+        now = self.app.node.timeline.now()
+        
+        process = Process(self, "_execute_restart", [record, secret_slot])
+        event = Event(now + wait_time_ps, process, self.app.node.timeline.schedule_counter)
+        self.app.node.timeline.schedule(event)
+
+    def _execute_restart(self, record: PacketRecord, secret_slot: int) -> None:
+        """Executes the re-encode after Bob has had time to process the CANCELs."""
         new_slots = self._encode_at(secret_slot)
         record.share_slots = new_slots
         record.share_transfer_ids = [None] * qss.N_SHARES
@@ -1145,6 +1160,12 @@ class QTCPOverseer:
             f"QTCPOverseer: packet {record.packet_id} re-encoded "
             f"(slots {new_slots}); restarting delivery"
         )
+        
+        # Resume the appropriate firing loop depending on the layer
+        if record.is_qec_layer:
+            self._fire_next_leaf_share(record)
+        else:
+            self._fire_shares(record.packet_id)
 
     def _finalize_delivered(self, record: PacketRecord) -> None:
         """Success path. Clean up Alice's held shares and signal Bob that no
@@ -1180,7 +1201,12 @@ class QTCPOverseer:
                 f"-> parent packet {parent.packet_id} share "
                 f"{record.parent_share_index} counts as DELIVERED"
             )
-            self._advance_packet(record.parent_packet_id)
+            wait_time_ps = self.app.rto.get(parent.dst, 1_000_000) 
+            now = self.app.node.timeline.now()
+            
+            process = Process(self, "_advance_packet", [record.parent_packet_id])
+            event = Event(now + wait_time_ps, process, self.app.node.timeline.schedule_counter)
+            self.app.node.timeline.schedule(event)
 
     def _finalize_lost(self, record: PacketRecord) -> None:
         """Loss path. Same cleanup as delivered -- Alice's slots freed, cancels
@@ -1241,7 +1267,12 @@ class QTCPOverseer:
                 f"-> parent packet {parent.packet_id} share "
                 f"{record.parent_share_index} counts as FAILED; CANCEL sent"
             )
-            self._advance_packet(record.parent_packet_id)
+            wait_time_ps = self.app.rto.get(parent.dst, 1_000_000) 
+            now = self.app.node.timeline.now()
+            
+            process = Process(self, "_advance_packet", [record.parent_packet_id])
+            event = Event(now + wait_time_ps, process, self.app.node.timeline.schedule_counter)
+            self.app.node.timeline.schedule(event)
 
     def _finalize_recovered(self, record: PacketRecord,
                             secret_slot: int) -> None:
@@ -1299,7 +1330,13 @@ class QTCPOverseer:
                 f"-> parent packet {parent.packet_id} share "
                 f"{record.parent_share_index} firing directly at slot {secret_slot}"
             )
-            self._fire_leaf(parent, record.parent_share_index, secret_slot)
+            # Inject wait before firing the recovered parent leaf
+            wait_time_ps = self.app.rto.get(parent.dst, 1_000_000) 
+            now = self.app.node.timeline.now()
+            
+            process = Process(self, "_fire_leaf", [parent, record.parent_share_index, secret_slot])
+            event = Event(now + wait_time_ps, process, self.app.node.timeline.schedule_counter)
+            self.app.node.timeline.schedule(event)
 
     def _cleanup_shares(self, record: PacketRecord) -> None:
         """Shared teardown for both terminal outcomes. For each share:
