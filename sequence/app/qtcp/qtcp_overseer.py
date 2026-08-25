@@ -1122,8 +1122,6 @@ class QTCPOverseer:
         # duplicate inflates his record count past N_SHARES and strands stale
         # records past the purge).
         for share_index in range(qss.N_SHARES):
-            if share_index in failed_positions:
-                continue
             tid = self.app.mint_transfer_id()
             self.app.node.send_message(
                 record.dst,

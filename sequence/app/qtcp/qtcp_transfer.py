@@ -651,6 +651,26 @@ class QTCPTransfer(RequestApp):
         tid = msg.transfer_id
         transfer = self.bob_transfers.get((src , tid))
 
+        if msg.packet_id is not None:
+            existing = next(
+                (r for r in self.bob_transfers.values()
+                if r.src == src
+                and r.packet_id == msg.packet_id
+                and r.share_index == msg.share_index),
+                None,
+            )
+            if existing is not None:
+                # Duplicate CANCEL for a share we already have. If the existing record
+                # is not yet terminal, transition it to CANCELLED; otherwise no-op.
+                if existing.state not in (BobState.CANCELLED, BobState.CONSUMED):
+                    if existing.state is BobState.ARRIVED:
+                        self.free_data_slot(existing.data_index)
+                        existing.data_index = None
+                    existing.state = BobState.CANCELLED
+                    for obs in self.terminal_observers:
+                        if hasattr(obs, "on_bob_transfer_finished"):
+                            obs.on_bob_transfer_finished(existing)
+                return        
         if transfer is None:
             # Never heard of it -- notice never arrived, or Alice never fired
             # (swept from PENDING at reservation end). Synthesize a CANCELLED
