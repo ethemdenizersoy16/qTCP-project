@@ -46,7 +46,9 @@ ket for arbitrary |psi>); probabilistic entanglement generation (circuit-
 switched, instant retry); multi-hop swapping; purification; asymmetric readout;
 crosstalk; congestion.
 """
-
+import numpy as np
+from threadpoolctl import threadpool_limits
+threadpool_limits(1)   
 import argparse
 import copy
 import csv
@@ -56,7 +58,7 @@ import sys
 import time
 import traceback
 
-import numpy as np
+
 
 # ----------------------------------------------------------------------------
 # CONFIGURATION -- edit these
@@ -217,7 +219,7 @@ def _code_version():
 CODE_VERSION = _code_version()
 
 MASTER_SEED = 20260817
-OUT_DIR = "/tmp/qtcp_bench"
+OUT_DIR = "/tmp/e2727956/qtcp_bench"
 
 ROW_FIELDS = [
     "arm", "ent_fid", "gate_fid", "meas_fid", "loss_rate",
@@ -1297,7 +1299,7 @@ def main():
     if args.workers > 1:
         import multiprocessing as mp
         with mp.Pool(args.workers, initializer=_init_worker,
-                     initargs=(base_cfg,), maxtasksperchild=200) as pool:
+                     initargs=(base_cfg,), maxtasksperchild=50) as pool:
             for i, row in enumerate(pool.imap_unordered(_do, todo,
                                                         chunksize=1)):
                 handle(i, row)
