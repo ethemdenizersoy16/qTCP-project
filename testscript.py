@@ -146,6 +146,8 @@ def install_no_entanglement_monkeypatch_once(qtcp_transfer_instance, failure_set
         original_fire(transfer, info)
 
     qtcp_transfer_instance._fire = patched_fire
+
+
 def assert_bob_pool_clean(bob_app):
     """Bob's data pool must be fully restored -- a LOST packet leaves nothing
     behind. No delivered secret to keep (LOST, not delivered)."""

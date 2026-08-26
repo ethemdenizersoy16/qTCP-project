@@ -1046,6 +1046,12 @@ class QTCPOverseer:
     def _execute_restart(self, record: PacketRecord, secret_slot: int) -> None:
         """Re-encode the recovered secret and resume delivery. Scheduled by
         _restart_packet_locally one RTO after the purge CANCELs go out."""
+        log.logger.info(
+    f"QTCPOverseer: packet {record.packet_id} _execute_restart entered, "
+    f"status pre-restore={record.share_status}"
+)
+
+
         new_slots = self._encode_at(secret_slot)
         record.share_slots = new_slots
         record.share_transfer_ids = [None] * qss.N_SHARES

@@ -972,7 +972,7 @@ class QTCPTransfer(RequestApp):
         if reason is not FailureReason.NO_ENTANGLEMENT:
             self.free_data_slot(transfer.data_memory_index)
     
-        if transfer.comm_memory is not None:
+        if transfer.comm_memory is not None and reason is not FailureReason.NO_ENTANGLEMENT:
             self.node.resource_manager.update(None, transfer.comm_memory, MemoryInfo.RAW)
     
         self.metrics.append({
