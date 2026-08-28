@@ -51,47 +51,17 @@ This repository is a fork of SeQUeNCe with qTCP added as a new application
 under `sequence/app/qtcp/`, plus a benchmark harness at the repo root.
 Everything else is upstream SeQUeNCe unchanged.
 
-├── sequence/app/qtcp/ # protocol implementation
-│ ├── qtcp_overseer.py # packet lifecycle, encoding, decoding
-│ ├── qtcp_transfer.py # single-qubit teleportation layer
-│ ├── qtcp_handshake.py # connection setup, QPing quality test
-│ ├── qec.py # [[5,1,3]] stabilizer code
-│ └── qss.py # ((3,5)) quantum secret sharing
-├── qtcp_bench.py # benchmark runner (multiprocess, resumable)
-├── tmp/three_node.json # topology config (Alice, Bob, Charlie)
-└── benchmark_results/ # raw benchmark CSVs
-
-## Branches
-
-- `main` — qTCP-v2.0 with dynamic decoding (current work).
-- `v1.0-benchmarked` — qTCP baseline, tagged at the commit that produced
-  the reference baseline CSV. Use this branch to reproduce the negative
-  result.
-
-## Reproducing the results
-
-Requires Python 3.12 and a Linux environment.
-
-```bash
-# clone and install in editable mode (following SeQUeNCe's install convention)
-git clone https://github.com/ethemdenizersoy16/qTCP-project.git
-cd qTCP-project
-make install_editable
-
-# verify plumbing (~30 seconds)
-python qtcp_bench.py --preflight-only
-
-# small pilot to confirm behaviour (~5 minutes)
-python qtcp_bench.py --pilot
-
-# full benchmark (~30 hours on 64 cores)
-python qtcp_bench.py --full --workers 64
 ```
-
-Results write incrementally to CSV and are resumable — a killed run picks
-up where it left off. Full-run parameters (grids, trial counts, seeds)
-are at the top of `qtcp_bench.py`.
-
+├── sequence/app/qtcp/          # protocol implementation
+│   ├── qtcp_overseer.py        # packet lifecycle, encoding, decoding
+│   ├── qtcp_transfer.py        # single-qubit teleportation layer
+│   ├── qtcp_handshake.py       # connection setup, QPing quality test
+│   ├── qec.py                  # [[5,1,3]] stabilizer code
+│   └── qss.py                  # ((3,5)) quantum secret sharing
+├── qtcp_bench.py               # benchmark runner (multiprocess, resumable)
+├── tmp/three_node.json         # topology config (Alice, Bob, Charlie)
+└── benchmark_results/          # raw benchmark CSVs
+```
 
 ## Branches
 
@@ -127,12 +97,26 @@ are at the top of `qtcp_bench.py`.
 ## Data
 
 Raw benchmark CSVs for both baseline (v1.0) and dynamic-decoding (v2.0)
-sweeps are in `benchmark_results/`. Each row represents one full packet
-transmission with all metrics recorded (delivery, fidelity, entanglement
-pairs consumed, gate count, send time, seed for reproduction).
-
-
+sweeps will be added to `benchmark_results/` once all runs complete.
+Each row represents one full packet transmission with all metrics
+recorded (delivery, fidelity, entanglement pairs consumed, gate count,
+send time, seed for reproduction).
 
 ## Citation
 
 If this work informs your research, please cite:
+
+```
+Ersoy, E. D. (2026). Benchmarking qTCP: negative results, dynamic
+decoding, and a comparison with QARQ.
+```
+
+## Acknowledgements
+
+Built on [SeQUeNCe](https://github.com/sequence-toolbox/SeQUeNCe)
+(Argonne National Laboratory). Developed as part of an undergraduate
+research internship at WINSLAB.
+
+## License
+
+MIT (matching SeQUeNCe's license).
