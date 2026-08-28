@@ -828,7 +828,7 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
 # ----------------------------------------------------------------------------
 
 def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
-              mixed=None):
+              mixed=None, mixed_corr=None, realistic_mixed=None):
     """Work plan as a list of arms.
 
     ideal      gate/meas perfect, ent-gen swept  -> metric 2 (QPing knee)
