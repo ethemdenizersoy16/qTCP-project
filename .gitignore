@@ -105,7 +105,7 @@ ENV/
 env.bak/
 venv.bak/
 .vscode
-tmp/
+
 
 # Spyder project settings
 .spyderproject
@@ -128,8 +128,7 @@ dmypy.json
 # PyCharm
 .idea/
 
-# csv files
-*.csv
+
 
 # vscode-workspace
 sequence_gui_testing.code-workspace
@@ -141,8 +140,6 @@ sequence/gui/test_run.py
 # macos
 .DS_Store
 
-# tmp folder
-tmp/
 
 # config file
 utils/json_config_generators/*.json
@@ -151,3 +148,6 @@ utils/json_config_generators/*.json
 
 # docstring files
 *.rst
+
+# Benchmark output CSVs -- commit only when complete
+benchmark_results/*.csv
