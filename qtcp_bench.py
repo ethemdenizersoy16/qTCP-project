@@ -178,6 +178,12 @@ MIXED_LOSS_RATES = [0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50]
 PILOT_MIXED_ENT = [0.99, 0.97]
 PILOT_MIXED_LOSS = [0.0, 0.10, 0.30]
 
+MIXED_CORR_ENT_FIDS = [0.95, 0.92, 0.90, 0.87, 0.85]
+MIXED_CORR_LOSS_RATES = [0.02, 0.05, 0.10]
+
+REALISTIC_MIXED_ENT_FIDS = [1.0, 0.99, 0.97, 0.95, 0.90]
+REALISTIC_MIXED_LOSS_RATES = [0.05, 0.10, 0.20, 0.30]
+
 FULL_N = 2000              # random-state trials per point
 FULL_N_FIXED = 400         # fixed-state trials per point
 
@@ -848,7 +854,15 @@ def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
         m_ent, m_loss = mixed
         arms.append(dict(name="mixed", ent_fids=m_ent, gate_fids=[1.0],
                          meas_fids=[1.0], losses=m_loss))
-
+    if mixed_corr:
+        m_ent, m_loss = mixed_corr
+        arms.append(dict(name="mixed_corr", ent_fids=m_ent, gate_fids=[1.0],
+                        meas_fids=[1.0], losses=m_loss))
+    if realistic_mixed:
+        r_ent, r_loss = realistic_mixed
+        arms.append(dict(name="realistic_mixed", ent_fids=r_ent,
+                        gate_fids=[REALISTIC_GATE_FID],
+                        meas_fids=[REALISTIC_MEAS_FID], losses=r_loss))
     # seed_base is unique BY CONSTRUCTION, not by luck. Drawing ~100k random
     # 31-bit seeds gives ~2 expected birthday collisions, and a collision means
     # two trials replay an identical trajectory -- small, but it is exactly the
@@ -1223,8 +1237,10 @@ def main():
         tag = "full"
 
     out = args.out or os.path.join(OUT_DIR, f"trials_{tag}.csv")
-    jobs = make_jobs(ent_fids, n_rand, n_fixed, gate_sweep=gsweep,
-                     loss_sweep=lsweep, mixed=mix)
+    jobs = make_jobs(ent_fids, n_rand, n_fixed,
+                 gate_sweep=gsweep, loss_sweep=lsweep, mixed=mix,
+                 mixed_corr=(MIXED_CORR_ENT_FIDS, MIXED_CORR_LOSS_RATES),
+                 realistic_mixed=(REALISTIC_MIXED_ENT_FIDS, REALISTIC_MIXED_LOSS_RATES))
     done = load_done(out)
     todo = [j for j in jobs if job_key(j) not in done]
 
