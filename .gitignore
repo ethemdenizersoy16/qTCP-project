@@ -149,5 +149,3 @@ utils/json_config_generators/*.json
 # docstring files
 *.rst
 
-# Benchmark output CSVs -- commit only when complete
-benchmark_results/*.csv
