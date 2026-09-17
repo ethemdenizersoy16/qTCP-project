@@ -358,26 +358,61 @@ class GateNoiseInjector:
                 res = orig_fn(*args, **kwargs)
 
                 # --- gate noise -------------------------------------------
+                                # --- gate noise -------------------------------------------
                 if gf < 1.0 and keys:
-                    n = getattr(circuit, "size", None) or len(keys)
-                    p = (1.5 * (1.0 - gf)) if n == 1 else (1.25 * (1.0 - gf))
-                    p = min(1.0, p)
-                    # ONE draw per gate, landing on one of the circuit's qubits.
-                    # Drawing per qubit PER gate multiplies the error rate by the
-                    # circuit width -- a 2-qubit 5-gate circuit would get 10 draws
-                    # where physics says 5. Which qubit each gate operates on is
-                    # not exposed, so the carrier is chosen uniformly; the total
-                    # error RATE, which is what gate_fid means, is correct.
-                    ngates = (len(getattr(circuit, "gates", None) or [1])
-                              if PER_GATE_NOISE else 1)
-                    ks = list(keys)          # keys may be any iterable
-                    for _ in range(ngates):
-                        if rng.random() < p:
-                            k = ks[rng.integers(len(ks))]
-                            # orig_fn, not the wrapper -- the error circuit
-                            # must not itself be noised.
-                            orig_fn(paulis[rng.integers(3)], [k], rng.random())
+                    ks = list(keys)
+                    gates = getattr(circuit, "gates", None) or []
+                    # Fallback: if the circuit didn't expose per-gate metadata,
+                    # treat the whole circuit as one gate of size len(ks). This
+                    # only fires when the circuit has no .gates attribute at
+                    # all -- normal SeQUeNCe circuits will always iterate below.
+                    if not gates:
+                        gates = [(None, list(range(len(ks))), None)]
+                    for gate in gates:
+                        # gate[1] is the LOCAL qubit indices (0-indexed within
+                        # the circuit's operand set), which we map through ks.
+                        local_qs = gate[1] if len(gate) > 1 else list(range(len(ks)))
+                        arity = len(local_qs)
+                        if arity == 0:
+                            continue
+                        # Standard depolarizing conversion:
+                        # p = ((d+1)/d) * (1 - F_avg) with d = 2^arity
+                        d = 1 << arity
+                        p_gate = min(1.0, ((d + 1) / d) * (1.0 - gf))
+                        if rng.random() >= p_gate:
+                            continue
+                        if arity == 1:
+                            q = ks[local_qs[0]]
+                            orig_fn(paulis[rng.integers(3)], [q], rng.random())
                             self.paulis_applied += 1
+                        elif arity == 2:
+                            # Draw uniformly from 15 non-identity 2q Paulis
+                            # via rejection sampling.
+                            while True:
+                                p1 = int(rng.integers(4))
+                                p2 = int(rng.integers(4))
+                                if p1 or p2:
+                                    break
+                            q1, q2 = ks[local_qs[0]], ks[local_qs[1]]
+                            if p1:
+                                orig_fn(paulis[p1 - 1], [q1], rng.random())
+                                self.paulis_applied += 1
+                            if p2:
+                                orig_fn(paulis[p2 - 1], [q2], rng.random())
+                                self.paulis_applied += 1
+                        else:
+                            # 3+ qubit gates. Rare in QEC. Draw from the full
+                            # non-identity n-qubit Pauli group.
+                            while True:
+                                choices = [int(rng.integers(4))
+                                           for _ in range(arity)]
+                                if any(choices):
+                                    break
+                            for i, pi in enumerate(choices):
+                                if pi:
+                                    q = ks[local_qs[i]]
+                                    orig_fn(paulis[pi - 1], [q], rng.random())
+                                    self.paulis_applied += 1
 
                 # --- measurement noise ------------------------------------
                 if mf < 1.0 and isinstance(res, dict) and res:
@@ -828,7 +863,8 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
 # ----------------------------------------------------------------------------
 
 def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
-              mixed=None, mixed_corr=None, realistic_mixed=None):
+              mixed=None, mixed_corr=None, realistic_mixed=None,
+              include_ideal=True, include_realistic=True):
     """Work plan as a list of arms.
 
     ideal      gate/meas perfect, ent-gen swept  -> metric 2 (QPing knee)
@@ -838,12 +874,20 @@ def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
     mixed      ent-gen AND loss both swept       -> the only arm where step 2
                                                    is observable
     """
-    arms = [
-        dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
-             meas_fids=[1.0], losses=[BASE_LOSS]),
-        dict(name="realistic", ent_fids=ent_fids, gate_fids=[REALISTIC_GATE_FID],
-             meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]),
-    ]
+    #arms = [
+     #   dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
+      #       meas_fids=[1.0], losses=[BASE_LOSS]),
+       # dict(name="realistic", ent_fids=ent_fids, gate_fids=[REALISTIC_GATE_FID],
+        #     meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]),
+    #]
+    arms = []
+    if include_ideal:
+        arms.append(dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
+                         meas_fids=[1.0], losses=[BASE_LOSS]))
+    if include_realistic:
+        arms.append(dict(name="realistic", ent_fids=ent_fids,
+                         gate_fids=[REALISTIC_GATE_FID],
+                         meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]))
     if gate_sweep:
         arms.append(dict(name="gatesweep", ent_fids=[1.0], gate_fids=gate_sweep,
                          meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]))
@@ -1207,6 +1251,14 @@ def main():
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--config", default=BASE_CONFIG_PATH)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--realistic-only", action="store_true",
+                    help="only F_ent=0.97, F_gate=0.999: realistic + "
+                         "realistic_mixed arms. Use with --full.")
+    ap.add_argument("--gate-arms-only", action="store_true",
+                    help="only F_gate<1 arms: realistic (corruption), "
+                         "gatesweep, and realistic_mixed. Skips ideal, "
+                         "losssweep, mixed, and mixed_corr. Use with --full.")
+    ap.add_argument("--mixed_corr", action="store_true")
     args = ap.parse_args()
 
     if not (args.pilot or args.full or args.preflight_only):
@@ -1230,17 +1282,48 @@ def main():
         mix = (PILOT_MIXED_ENT, PILOT_MIXED_LOSS)
         tag = "pilot"
     else:
-        ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
-        gsweep = GATE_SWEEP_FIDS
-        lsweep = LOSS_SWEEP_RATES
-        mix = (MIXED_ENT_FIDS, MIXED_LOSS_RATES)
-        tag = "full"
-
+        if args.realistic_only:
+            ent_fids = [0.97]
+            n_rand, n_fixed = FULL_N, FULL_N_FIXED
+            gsweep = None
+            lsweep = None
+            mix = None
+            mixed_corr = None
+            r_mix = ([0.97], REALISTIC_MIXED_LOSS_RATES)
+            tag = "realistic_only"
+        elif args.gate_arms_only:
+            # All F_gate<1 arms only. Skips ideal, losssweep, mixed, mixed_corr
+            # -- these use F_gate=1 so the injector never touches them and
+            # their results from a prior full run are still valid.
+            ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
+            gsweep = GATE_SWEEP_FIDS
+            lsweep = None
+            mix = None
+            mixed_corr = None
+            r_mix = (REALISTIC_MIXED_ENT_FIDS, REALISTIC_MIXED_LOSS_RATES)
+            tag = "gate_arms"
+        elif args.mixed_corr:
+            ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
+            gsweep = None
+            lsweep = None
+            mix = None
+            mixed_corr = (MIXED_CORR_ENT_FIDS, MIXED_CORR_LOSS_RATES)
+            r_mix = None
+            tag = "mixed_corr"
+        else:
+            ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
+            gsweep = GATE_SWEEP_FIDS
+            lsweep = LOSS_SWEEP_RATES
+            mix = (MIXED_ENT_FIDS, MIXED_LOSS_RATES)
+            mixed_corr = (MIXED_CORR_ENT_FIDS, MIXED_CORR_LOSS_RATES)
+            r_mix = (REALISTIC_MIXED_ENT_FIDS, REALISTIC_MIXED_LOSS_RATES)
+            tag = "full"
     out = args.out or os.path.join(OUT_DIR, f"trials_{tag}.csv")
     jobs = make_jobs(ent_fids, n_rand, n_fixed,
-                 gate_sweep=gsweep, loss_sweep=lsweep, mixed=mix,
-                 mixed_corr=(MIXED_CORR_ENT_FIDS, MIXED_CORR_LOSS_RATES),
-                 realistic_mixed=(REALISTIC_MIXED_ENT_FIDS, REALISTIC_MIXED_LOSS_RATES))
+                     gate_sweep=gsweep, loss_sweep=lsweep, mixed=mix,
+                     mixed_corr=mixed_corr, realistic_mixed=r_mix,
+                     include_ideal=not (args.realistic_only
+                                        or args.gate_arms_only))
     done = load_done(out)
     todo = [j for j in jobs if job_key(j) not in done]
 
@@ -1537,6 +1620,56 @@ def summarise(path):
         print("  (Read this on FIXED states only. On random inputs a clean")
         print("   logical Pauli gives mean F = 1/3 with a smooth spread, which")
         print("   would look like partial failure when it is not.)")
+    # ---------- silent-error breakdown for Realistic Mixed arm --------------
+# Grouped by F_ent to show how silent-error rate scales with corruption.
+# Loss values are pooled within each F_ent row (or broken out further
+# below if you set BREAK_OUT_LOSS = True).
+
+    BREAK_OUT_LOSS = True   # set True to see silent-rate per (F_ent, loss)
+
+    rm_rows = [r for r in rows
+            if r["arm"] == "realistic_mixed" and r["state_kind"] == "random"]
+
+    if rm_rows:
+        print("\n" + "=" * 78)
+        print("SILENT ERROR RATES for Realistic Mixed arm "
+            "(F_gate = 0.999, random-state)")
+        print("=" * 78)
+
+        def _report(group, label):
+            n = len(group)
+            n_del = sum(1 for r in group if int(r["delivered"]) == 1)
+            n_silent = sum(1 for r in group
+                        if r["outcome"] == "DELIVERED"
+                        and int(r["delivered"]) == 0)
+            n_detected = sum(1 for r in group if r["outcome"] != "DELIVERED")
+            silent_rate = n_silent / n if n > 0 else 0.0
+            fs = [float(r["fidelity"]) for r in group
+                if r["fidelity"] not in ("", "nan")]
+            mean_F = np.mean(fs) if fs else float("nan")
+            assert n_del + n_silent + n_detected == n, (
+                f"{label}: {n_del}+{n_silent}+{n_detected} != {n}")
+            print(f"{label:22} {n:>6d} {n_del:>10d} {n_silent:>7d} "
+                f"{n_detected:>9d} {silent_rate:>11.4f}  {mean_F:>8.4f}")
+
+        header = f'{"F_ent":22} {"n":>6} {"delivered":>10} {"silent":>7} ' \
+                f'{"detected":>9} {"silent_rate":>12} {"mean_F":>8}'
+        print(header)
+
+        fents = sorted({float(r["ent_fid"]) for r in rm_rows}, reverse=True)
+        for fe in fents:
+            fe_rows = [r for r in rm_rows if float(r["ent_fid"]) == fe]
+            if BREAK_OUT_LOSS:
+                losses = sorted({float(r["loss_rate"]) for r in fe_rows})
+                for lr in losses:
+                    cell = [r for r in fe_rows if float(r["loss_rate"]) == lr]
+                    _report(cell, f"F={fe:.3f}, l={lr:.2f}")
+            else:
+                _report(fe_rows, f"F_ent = {fe:.3f}")
+
+        print()
+        print("  silent = trials where outcome is DELIVERED but F <= 0.999.")
+        print("  detected = outcome != DELIVERED. silent_rate = silent / n.")
 
 
 if __name__ == "__main__":
