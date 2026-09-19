@@ -51,7 +51,7 @@ This repository is a fork of SeQUeNCe with qTCP added as a new application
 under `sequence/app/qtcp/`, plus a benchmark harness at the repo root.
 Everything else is upstream SeQUeNCe unchanged.
 
-```
+​```
 ├── sequence/app/qtcp/          # protocol implementation
 │   ├── qtcp_overseer.py        # packet lifecycle, encoding, decoding
 │   ├── qtcp_transfer.py        # single-qubit teleportation layer
@@ -61,7 +61,7 @@ Everything else is upstream SeQUeNCe unchanged.
 ├── qtcp_bench.py               # benchmark runner (multiprocess, resumable)
 ├── tmp/three_node.json         # topology config (Alice, Bob, Charlie)
 └── benchmark_results/          # raw benchmark CSVs
-```
+​```
 
 ## Branches
 
@@ -74,9 +74,9 @@ Everything else is upstream SeQUeNCe unchanged.
 
 Requires Python 3.12 and a Linux environment.
 
-```bash
-# clone and install in editable mode (following SeQUeNCe's install convention)
-git clone https://github.com/ethemdenizersoy16/qTCP-project.git
+​```bash
+# obtain the source tree via the "Download Repository" button on
+# anonymous.4open.science, or clone the anonymized repository directly
 cd qTCP-project
 make install_editable
 
@@ -88,7 +88,7 @@ python qtcp_bench.py --pilot
 
 # full benchmark (~30 hours on 64 cores)
 python qtcp_bench.py --full --workers 64
-```
+​```
 
 Results write incrementally to CSV and are resumable — a killed run picks
 up where it left off. Full-run parameters (grids, trial counts, seeds)
@@ -102,20 +102,10 @@ Each row represents one full packet transmission with all metrics
 recorded (delivery, fidelity, entanglement pairs consumed, gate count,
 send time, seed for reproduction).
 
-## Citation
-
-If this work informs your research, please cite:
-
-```
-Ersoy, E. D. (2026). Benchmarking qTCP: negative results, dynamic
-decoding, and a comparison with QARQ.
-```
-
 ## Acknowledgements
 
 Built on [SeQUeNCe](https://github.com/sequence-toolbox/SeQUeNCe)
-(Argonne National Laboratory). Developed as part of an undergraduate
-research internship at WINSLAB.
+(Argonne National Laboratory).
 
 ## License
 
