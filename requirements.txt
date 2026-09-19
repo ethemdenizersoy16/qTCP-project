@@ -114,7 +114,6 @@ rpds-py==2026.6.3
 scipy==1.18.1
 seaborn==0.13.2
 Send2Trash==2.1.0
--e git+https://github.com/ethemdenizersoy16/qTCP-project@76490deb40f62cd22b8249a232105381bbe7f335#egg=sequence
 setuptools==83.0.0
 shellingham==1.5.4
 six==1.17.0
