@@ -51,7 +51,7 @@ This repository is a fork of SeQUeNCe with qTCP added as a new application
 under `sequence/app/qtcp/`, plus a benchmark harness at the repo root.
 Everything else is upstream SeQUeNCe unchanged.
 
-​```
+```
 ├── sequence/app/qtcp/          # protocol implementation
 │   ├── qtcp_overseer.py        # packet lifecycle, encoding, decoding
 │   ├── qtcp_transfer.py        # single-qubit teleportation layer
@@ -61,7 +61,7 @@ Everything else is upstream SeQUeNCe unchanged.
 ├── qtcp_bench.py               # benchmark runner (multiprocess, resumable)
 ├── tmp/three_node.json         # topology config (Alice, Bob, Charlie)
 └── benchmark_results/          # raw benchmark CSVs
-​```
+```
 
 ## Branches
 
@@ -74,7 +74,7 @@ Everything else is upstream SeQUeNCe unchanged.
 
 Requires Python 3.12 and a Linux environment.
 
-​```bash
+```bash
 # obtain the source tree via the "Download Repository" button on
 # anonymous.4open.science, or clone the anonymized repository directly
 cd qTCP-project
@@ -88,7 +88,7 @@ python qtcp_bench.py --pilot
 
 # full benchmark (~30 hours on 64 cores)
 python qtcp_bench.py --full --workers 64
-​```
+```
 
 Results write incrementally to CSV and are resumable — a killed run picks
 up where it left off. Full-run parameters (grids, trial counts, seeds)
