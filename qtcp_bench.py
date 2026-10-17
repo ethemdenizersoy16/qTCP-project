@@ -307,12 +307,15 @@ class GateNoiseInjector:
         p_error = 1.25 * (1 - two_qubit_gate_fid)     # two-qubit gates
 
     That is the standard average-gate-fidelity -> depolarizing-probability
-    conversion. One draw is made PER GATE; on error a uniformly random
-    non-identity Pauli lands on one of the circuit's qubits, chosen uniformly
-    because which operand each gate acts on is not exposed. The total error
-    RATE -- which is what gate_fid means -- is therefore correct, and does not
-    scale with register width. Measurement infidelity flips each returned
-    outcome bit with probability (1 - meas_fid).
+    conversion. One draw is made PER GATE at total probability p. For 1-qubit
+    gates the error is a random single-qubit Pauli. For 2-qubit gates the
+    error is drawn uniformly from the 15 non-identity 2-qubit Paulis via
+    rejection sampling on the two-qubit register; this reproduces the standard
+    2-qubit depolarizing channel exactly (6/15 weight-1, 9/15 weight-2). Which
+    two qubits each 2-qubit gate operates on is not exposed by the simulator,
+    so for a wider containing register the two carrier qubits are picked
+    uniformly; the total error rate is correct regardless. Measurement
+    infidelity flips each returned outcome bit with probability (1 - meas_fid).
 
     REPORT THIS HONESTLY: it is a channel model applied at the simulation
     boundary, not noise emerging from the protocol implementation. Say so, and
@@ -352,25 +355,59 @@ class GateNoiseInjector:
 
                 # --- gate noise -------------------------------------------
                 if gf < 1.0 and keys:
-                    n = getattr(circuit, "size", None) or len(keys)
-                    p = (1.5 * (1.0 - gf)) if n == 1 else (1.25 * (1.0 - gf))
-                    p = min(1.0, p)
-                    # ONE draw per gate, landing on one of the circuit's qubits.
-                    # Drawing per qubit PER gate multiplies the error rate by the
-                    # circuit width -- a 2-qubit 5-gate circuit would get 10 draws
-                    # where physics says 5. Which qubit each gate operates on is
-                    # not exposed, so the carrier is chosen uniformly; the total
-                    # error RATE, which is what gate_fid means, is correct.
-                    ngates = (len(getattr(circuit, "gates", None) or [1])
-                              if PER_GATE_NOISE else 1)
-                    ks = list(keys)          # keys may be any iterable
-                    for _ in range(ngates):
-                        if rng.random() < p:
-                            k = ks[rng.integers(len(ks))]
-                            # orig_fn, not the wrapper -- the error circuit
-                            # must not itself be noised.
-                            orig_fn(paulis[rng.integers(3)], [k], rng.random())
+                    ks = list(keys)
+                    gates = getattr(circuit, "gates", None) or []
+                    # Fallback: if the circuit didn't expose per-gate metadata,
+                    # treat the whole circuit as one gate of size len(ks). This
+                    # only fires when the circuit has no .gates attribute at
+                    # all -- normal SeQUeNCe circuits will always iterate below.
+                    if not gates:
+                        gates = [(None, list(range(len(ks))), None)]
+                    for gate in gates:
+                        # gate[1] is the LOCAL qubit indices (0-indexed within
+                        # the circuit's operand set), which we map through ks.
+                        local_qs = gate[1] if len(gate) > 1 else list(range(len(ks)))
+                        arity = len(local_qs)
+                        if arity == 0:
+                            continue
+                        # Standard depolarizing conversion:
+                        # p = ((d+1)/d) * (1 - F_avg) with d = 2^arity
+                        d = 1 << arity
+                        p_gate = min(1.0, ((d + 1) / d) * (1.0 - gf))
+                        if rng.random() >= p_gate:
+                            continue
+                        if arity == 1:
+                            q = ks[local_qs[0]]
+                            orig_fn(paulis[rng.integers(3)], [q], rng.random())
                             self.paulis_applied += 1
+                        elif arity == 2:
+                            # Draw uniformly from 15 non-identity 2q Paulis
+                            # via rejection sampling.
+                            while True:
+                                p1 = int(rng.integers(4))
+                                p2 = int(rng.integers(4))
+                                if p1 or p2:
+                                    break
+                            q1, q2 = ks[local_qs[0]], ks[local_qs[1]]
+                            if p1:
+                                orig_fn(paulis[p1 - 1], [q1], rng.random())
+                                self.paulis_applied += 1
+                            if p2:
+                                orig_fn(paulis[p2 - 1], [q2], rng.random())
+                                self.paulis_applied += 1
+                        else:
+                            # 3+ qubit gates. Rare in QEC. Draw from the full
+                            # non-identity n-qubit Pauli group.
+                            while True:
+                                choices = [int(rng.integers(4))
+                                           for _ in range(arity)]
+                                if any(choices):
+                                    break
+                            for i, pi in enumerate(choices):
+                                if pi:
+                                    q = ks[local_qs[i]]
+                                    orig_fn(paulis[pi - 1], [q], rng.random())
+                                    self.paulis_applied += 1
 
                 # --- measurement noise ------------------------------------
                 if mf < 1.0 and isinstance(res, dict) and res:
@@ -821,7 +858,7 @@ def run_trial(base_cfg, arm, ent_fid, gate_fid, meas_fid,
 # ----------------------------------------------------------------------------
 
 def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
-              mixed=None):
+              mixed=None, include_ideal=True, include_realistic=True):
     """Work plan as a list of arms.
 
     ideal      gate/meas perfect, ent-gen swept  -> metric 2 (QPing knee)
@@ -831,12 +868,14 @@ def make_jobs(ent_fids, n_random, n_fixed, gate_sweep=None, loss_sweep=None,
     mixed      ent-gen AND loss both swept       -> the only arm where step 2
                                                    is observable
     """
-    arms = [
-        dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
-             meas_fids=[1.0], losses=[BASE_LOSS]),
-        dict(name="realistic", ent_fids=ent_fids, gate_fids=[REALISTIC_GATE_FID],
-             meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]),
-    ]
+    arms = []
+    if include_ideal:
+        arms.append(dict(name="ideal", ent_fids=ent_fids, gate_fids=[1.0],
+                         meas_fids=[1.0], losses=[BASE_LOSS]))
+    if include_realistic:
+        arms.append(dict(name="realistic", ent_fids=ent_fids,
+                         gate_fids=[REALISTIC_GATE_FID],
+                         meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]))
     if gate_sweep:
         arms.append(dict(name="gatesweep", ent_fids=[1.0], gate_fids=gate_sweep,
                          meas_fids=[REALISTIC_MEAS_FID], losses=[BASE_LOSS]))
@@ -1192,6 +1231,10 @@ def main():
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--config", default=BASE_CONFIG_PATH)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--gate-arms-only", action="store_true",
+                    help="only F_gate<1 arms: realistic (corruption) and "
+                         "gatesweep. Skips ideal, losssweep, mixed. Use with "
+                         "--full.")
     args = ap.parse_args()
 
     if not (args.pilot or args.full or args.preflight_only):
@@ -1215,15 +1258,26 @@ def main():
         mix = (PILOT_MIXED_ENT, PILOT_MIXED_LOSS)
         tag = "pilot"
     else:
-        ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
-        gsweep = GATE_SWEEP_FIDS
-        lsweep = LOSS_SWEEP_RATES
-        mix = (MIXED_ENT_FIDS, MIXED_LOSS_RATES)
-        tag = "full"
+        if args.gate_arms_only:
+            # All F_gate<1 arms only. Skips ideal, losssweep, mixed --
+            # these use F_gate=1 so the injector never touches them and
+            # their results from a prior full run are still valid.
+            ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
+            gsweep = GATE_SWEEP_FIDS
+            lsweep = None
+            mix = None
+            tag = "gate_arms"
+        else:
+            ent_fids, n_rand, n_fixed = FULL_ENT_FIDS, FULL_N, FULL_N_FIXED
+            gsweep = GATE_SWEEP_FIDS
+            lsweep = LOSS_SWEEP_RATES
+            mix = (MIXED_ENT_FIDS, MIXED_LOSS_RATES)
+            tag = "full"
 
     out = args.out or os.path.join(OUT_DIR, f"trials_{tag}.csv")
     jobs = make_jobs(ent_fids, n_rand, n_fixed, gate_sweep=gsweep,
-                     loss_sweep=lsweep, mixed=mix)
+                     loss_sweep=lsweep, mixed=mix,
+                     include_ideal=not args.gate_arms_only)
     done = load_done(out)
     todo = [j for j in jobs if job_key(j) not in done]
 
