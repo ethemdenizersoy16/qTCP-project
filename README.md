@@ -47,12 +47,8 @@ cd qTCP-v1
 
 conda create -n qtcp-v1 python=3.12 -y
 conda activate qtcp-v1
-make install_editable          # installs this SeQUeNCe fork and its dependencies
-pip install threadpoolctl      # used by qtcp_bench.py
-
-# topology config (not tracked on this branch; identical to main's)
-mkdir -p tmp
-git show origin/main:tmp/three_node.json > tmp/three_node.json
+pip install -r requirements.txt          # pinned versions used for the paper runs
+make install_editable                    # installs this SeQUeNCe fork in editable mode
 ```
 
 ```bash
