@@ -9,7 +9,7 @@ and Dynamic Decoding"* by Ethem Deniz Ersoy and Ertan Onur (WINS Lab, Middle
 East Technical University), submitted to IEEE ICC 2027.
 
 **The dynamic-decoding variant (v2.0), the full documentation and most of the
-raw data are on the [`main`](../../tree/main) branch.**
+raw data are on the [`main`](https://github.com/ethemdenizersoy16/qTCP-project/tree/main) branch.**
 
 ## What v1.0 does
 
@@ -48,8 +48,10 @@ cd qTCP-v1
 conda create -n qtcp-v1 python=3.12 -y
 conda activate qtcp-v1
 pip install -r requirements.txt          # pinned versions used for the paper runs
-make install_editable                    # installs this SeQUeNCe fork in editable mode
 ```
+
+Run all commands from the repository root. `qtcp_bench.py` imports the local
+`sequence/` package directly, so no install step is needed.
 
 ```bash
 # check the plumbing
