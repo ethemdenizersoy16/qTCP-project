@@ -1,166 +1,102 @@
-<p align="center">
-  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sequence-toolbox/SeQUeNCe/master/docs/Sequence_Icon_Name_Dark.png">
-   <img src="https://raw.githubusercontent.com/sequence-toolbox/SeQUeNCe/master/docs/Sequence_Icon_Name.svg" alt="sequence icon" width="450" class="center">
-  </picture>
-</p>
+# qTCP v1.0: Baseline Implementation
 
-<h3><p align="center">Quantum Networking in SeQUeNCe: Customizable, Scalable, Easy Debugging</p></h3>
+This branch holds **qTCP v1.0**, the baseline implementation of the qTCP quantum
+transport protocol
+[[Yu, Lai & Zhou, IEEE TQE 2021]](https://arxiv.org/abs/1903.10685) as
+specified. It runs on the [SeQUeNCe](https://github.com/sequence-toolbox/SeQUeNCe)
+quantum network simulator. It accompanies *"qTCP: Implementation, Benchmarking,
+and Dynamic Decoding"* by Ethem Deniz Ersoy and Ertan Onur (WINS Lab, Middle
+East Technical University), submitted to IEEE ICC 2027.
 
+**The dynamic-decoding variant (v2.0), the full documentation and most of the
+raw data are on the [`main`](../../tree/main) branch.**
 
+## What v1.0 does
 
-<div align="center">
+Each logical qubit is encoded into five shares with ((3,5)) quantum secret
+sharing (QSS). Each share is protected by the [[5,1,3]] quantum error-correcting
+code (QEC), forming the leaves. If held plus delivered shares of a non-leaf
+block drop to k = 3, Alice recursively QSS-encodes its next share. Leaves are
+never recursed on.
 
-[![PyPi](https://img.shields.io/pypi/v/sequence)](https://pypi.org/project/sequence/)
-![pyversions](https://img.shields.io/pypi/pyversions/sequence)
-[![CI Pipeline](https://github.com/sequence-toolbox/SeQUeNCe/actions/workflows/ci.yml/badge.svg)](https://github.com/sequence-toolbox/SeQUeNCe/actions/workflows/ci.yml)
-[![Documentation](https://img.shields.io/readthedocs/sequence-rtd-tutorial)](https://sequence-rtd-tutorial.readthedocs.io/)
-[![QuTiP](https://img.shields.io/badge/integration-QuTiP-blue)](https://qutip.org/)
-[![Stim](https://img.shields.io/badge/integration-Stim-blue)](https://github.com/quantumlib/Stim)
-[![Paper](https://img.shields.io/badge/10.1088%2F2058-9565%2Fac22f6?label=DOI)](https://iopscience.iop.org/article/10.1088/2058-9565/ac22f6)
-[![Download-month](https://img.shields.io/pypi/dm/sequence)](https://pypistats.org/packages/sequence)
+v1.0 follows a **fail-stop** policy:
 
-</div>
+- A leaf goes LOST on its first failed share. There are no restarts.
+- QSS layers stop sending as soon as k = 3 shares are delivered.
+- Bob always erasure-decodes from three shares.
 
+## Headline result
 
+At tree depth one, v1.0 is worse than bare teleportation at almost every
+non-trivial operating point tested. Each attempt costs about 15× the
+entanglement (14.5 pairs per attempt).
 
-<br>
+- **Pure loss:** break-even against bare is at ℓ ≈ 0.032. At ℓ = 0.30, v1.0
+  delivers 4% of qubits versus bare's 70%.
+- **Pure corruption (ideal gates):** break-even against bare is at ε ≈ 0.034.
 
-## SeQUeNCe: Simulator of QUantum Network Communication
+v2.0 on `main` shifts these thresholds to ℓ > 0.60 and ε ≈ 0.14–0.18.
 
-SeQUeNCe is an open source, discrete-event simulator for quantum networks. As described in our [paper](http://arxiv.org/abs/2009.12000), the simulator includes 5 modules on top of a simulation kernel:
-* Hardware
-* Entanglement Management
-* Resource Management
-* Network Management
-* Application
+## Reproducing the results
 
-These modules can be edited by users to define additional functionality and test protocol schemes, or may be used as-is to test network parameters and topologies.
-
-## Installation
-### For Users
-SeQUeNCe requires [Python](https://www.python.org/downloads/) 3.12 or later. You can install SeQUeNCe using `pip`:
-```
-pip install sequence
-```
-
-### Development Environment Setup     
-If you wish to modify the source code, use an editable installation with either pip or [uv](https://docs.astral.sh/uv/):
-
-Editable installations let Python use your local source tree directly, so changes you make to the SeQUeNCe code are available **without reinstalling the package after each edit**. The `pip` option is a lightweight way to install the local package into an environment you already manage, while `uv` can create and synchronize a reproducible virtual environment from the project's dependency files.
-
-#### (1) Using pip
-```
-git clone https://github.com/sequence-toolbox/SeQUeNCe.git
-cd sequence
-make install_editable
-```
-
-In the Makefile, `install_editable` will run the following:
-```
-pip install --editable . --config-settings editable_mode=strict
-```
-The `--config-settings editable_mode=strict` setting makes the editable install behaves more like a real packaged install.
-
-#### (2) Using uv 
-
-##### Install uv ([Astral Instructions](https://docs.astral.sh/uv/getting-started/installation/))
+The runs use Python 3.12 on Linux.
 
 ```bash
-# macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone -b v1.0-benchmarked https://github.com/ethemdenizersoy16/qTCP-project.git qTCP-v1
+cd qTCP-v1
 
-# Windows
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+conda create -n qtcp-v1 python=3.12 -y
+conda activate qtcp-v1
+make install_editable          # installs this SeQUeNCe fork and its dependencies
+pip install threadpoolctl      # used by qtcp_bench.py
+
+# topology config (not tracked on this branch; identical to main's)
+mkdir -p tmp
+git show origin/main:tmp/three_node.json > tmp/three_node.json
 ```
-
-##### Clone the repository and create the virtual environment
-
-Here we clone the repository and let uv configure the development environment with the target python version.
-```bash
-git clone https://github.com/sequence-toolbox/SeQUeNCe.git
-cd sequence
-uv sync
-```
-
-##### Activate the virtual environment
-
-Now that the virtual environment is created with all dependencies installed, you can activate it using the following command.
 
 ```bash
-source .venv/bin/activate # macOS/Linux
-source .venv\Scripts\activate # Windows
+# check the plumbing
+python qtcp_bench.py --preflight-only
+
+# gate-noise arms (realistic, gate sweep): reproduces benchmark_results/trials_gate_arms.csv
+python qtcp_bench.py --full --gate-arms-only --workers 64
+
+# all five v1.0 arms (ideal, realistic, gate sweep, loss, high-loss mixed)
+python qtcp_bench.py --full --workers 64
 ```
 
-##### Running the test suite
+- **Output:** by default the runner writes to
+  `/tmp/e2727956/qtcp_bench/trials_<tag>.csv`. Use `--out PATH` to change this.
+- **Resuming:** runs can be resumed. If no trials are left, the runner prints
+  the summary (success rate with 95% Clopper–Pearson intervals, mean fidelity,
+  send time).
+- **Determinism:** seeds are `(MASTER_SEED << 20) + job_index` with
+  `MASTER_SEED = 20260817`, so reruns reproduce rows exactly.
 
-SeQUeNCe includes a comprehensive test suite, this can be ran with the following command
-```
-uv run pytest tests
-```
+## Data
 
-## Citation
-Please cite us, thank you!
-```
-@article{sequence,
-author = {Xiaoliang Wu and Alexander Kolar and Joaquin Chung and Dong Jin and Tian Zhong and Rajkumar Kettimuthu and Martin Suchara},
-title = {SeQUeNCe: a customizable discrete-event simulator of quantum networks},
-journal = {Quantum Science and Technology},
-volume = {6},
-year = {2021},
-month = {sep},
-doi = {10.1088/2058-9565/ac22f6},
-url = {https://dx.doi.org/10.1088/2058-9565/ac22f6},
-publisher = {IOP Publishing},
-}
-```
+| File | Contents |
+|---|---|
+| `benchmark_results/trials_gate_arms.csv` (this branch) | v1.0 realistic and gate-sweep arms, 26 cells × (2000 random-state + 399 fixed-state trials). **Paper source** for all v1.0 results with F_gate < 1. |
+| `benchmark_results/trials_full.v1.csv` (on `main`) | v1.0 ideal, loss and high-loss mixed arms. **Paper source** for those arms. Its `realistic` and `gatesweep` rows use the old gate-noise injector and are superseded by the file above. |
 
-<!-- * X. Wu, A. Kolar, J. Chung, D. Jin, T. Zhong, R. Kettimuthu and M. Suchara. "SeQUeNCe: Simulator of QUantum Network Communication." GitHub repository, https://github.com/sequence-toolbox/SeQUeNCe, 2021. -->
+The gate-arm rows use the corrected gate-noise injector committed in `631cae7`.
+It draws a Pauli error with probability ((d+1)/d)(1 − F_gate) on each gate's own
+operands and is identical to the injector on `main`. The rows are stamped
+`a022e8a-dirty` because the run used that script on top of `a022e8a` before it
+was committed. Its success rates, mean fidelities and send times match the
+original September run.
 
-## Running the GUI
-Once SeQUeNCe has been installed as described above, run the `gui.py` script found in the root of the project directory
-```
-python gui.py
-```
+The CSV columns and the success / silent-error definitions are the same as on
+`main`. `delivered = 1` means the outcome is `DELIVERED` and fidelity > 0.999.
+See the `main` README for the full column table.
 
-## Usage Examples
-Many examples of SeQUeNCe in action can be found in the [example](/example) folder. The example includes jupyter notebook demos, and code used in published papers.
+## Acknowledgements
 
-## Additional Tools
+Built on [SeQUeNCe](https://github.com/sequence-toolbox/SeQUeNCe)
+(Argonne National Laboratory).
 
-### Network Visualization
-The example directory contains an example .json file `starlight.json` to specify a network topology, and the utils directory contains the script `draw_topo.py` to visualize json files. To use this script, the Graphviz library must be installed. Installation information can be found on the [Graphviz website](https://www.graphviz.org/download/).
+## License
 
-To view a network, run the script and specify the relative location of your .json file:
-```
-python utils/draw_topo.py example/starlight.json
-```
-This script also supports a flag `-m` to visualize BSM nodes created by default on quantum links between routers.
-
-## Contact
-If you have questions, please contact [Caitao Zhan](https://caitaozhan.github.io/) at [czhan@anl.gov](mailto:czhan@anl.gov).
-
-Here is the updated table with the Code column populated:
-
-## Papers that Used and/or Extended SeQUeNCe
-| Year | Authors | Title | Venue | Code |
-|------|---------|-------|-------|------|
-| 2026 | S. Pantage et al. | [Realistic Simulation of Quantum Repeater with Encoding and Classical Error Correction](https://arxiv.org/abs/2605.06928) | arXiv preprint | [GitHub](https://github.com/SagarPatange/Quantum-Repeater-Encoding) |
-| 2026 | A. Pirker et al. | [Centralizing Task-based Approach to Quantum Network Control](https://arxiv.org/abs/2605.03336) | arXiv preprint | [GitHub](https://github.com/sequence-toolbox/central_scheduler) |
-| 2026 | A. Amlou et al. | [Physics-Informed Discrete-Event Simulation of Polarization-Encoded Quantum Networks](https://arxiv.org/abs/2604.07289) | arXiv preprint | |
-| 2026 | H. Miller et al. | [Simulation of a Heterogeneous Quantum Network](https://doi.org/10.1109/QCNC69040.2026.00085) | IEEE QCNC | [GitHub](https://github.com/haydenmllr1317/heterogenous) |
-| 2026 | A. Zang et al. | [Quantum Advantage in Distributed Sensing with Noisy Quantum Networks](https://doi.org/10.1103/7n9w-9xd4) | Physical Review Research | |
-| 2025 | C. Zhan et al. | [Design and Simulation of the Adaptive Continuous Entanglement Generation Protocol](https://doi.org/10.1109/QCNC64685.2025.00028) | IEEE QCNC | [GitHub](https://github.com/caitaozhan/adaptive-continuous) |
-| 2025 | F. Mazza et al. | [Simulation of Entanglement-Enabled Connectivity in QLANs using SeQUeNCe](https://doi.org/10.1109/ICC52391.2025.11434940) | IEEE ICC | |
-| 2025 | L. d'Avossa et al. | [Simulation of Quantum Transduction Strategies for Quantum Networks](https://doi.org/10.1109/QCE65121.2025.00142) | IEEE QCE | |
-| 2025 | V. S. Mai et al. | [Towards Optimal Orders for Entanglement Swapping in Path Graphs: A Greedy Approach](https://arxiv.org/abs/2504.14040) | IEEE QCE | |
-| 2024 | C. Howe et al. | [Towards Scalable Quantum Repeater Networks](https://arxiv.org/abs/2409.08416) | arXiv preprint | |
-| 2024 | X. Wu et al. | [Parallel Simulation of Quantum Networks with Distributed Quantum State Management](https://dl.acm.org/doi/abs/10.1145/3634701) | ACM TOMACS | |
-| 2023 | R. Zhou et al. | [A Simulator of Atom-Atom Entanglement with Atomic Ensembles and Quantum Optics](https://doi.org/10.1109/QCE57702.2023.00143) | IEEE QCE | |
-| 2023 | M.G. Davis et al. | [Towards Distributed Quantum Computing by Qubit and Gate Graph Partitioning Techniques](https://doi.org/10.1109/QCE57702.2023.00026) | IEEE QCE | |
-| 2022 | A. Zang et al. | [Simulation of Entanglement Generation between Absorptive Quantum Memories](https://doi.org/10.1109/QCE53715.2022.00084) | IEEE QCE | |
-| 2022 | V. Semenenko et al. | [Entanglement generation in a quantum network with finite quantum memory lifetime](https://doi.org/10.1116/5.0082239) | AVS Quantum Science | |
-| 2021 | X. Wu et al. | [SeQUeNCe: A Customizable Discrete-Event Simulator of Quantum Networks](https://iopscience.iop.org/article/10.1088/2058-9565/ac22f6) | IOP Quantum Science and Technology | |
-| 2019 | X. Wu et al. | [Simulations of Photonic Quantum Networks for Performance Analysis and Experiment Design](https://ieeexplore.ieee.org/document/8950718) | IEEE/ACM PHOTONICS | |
-
-Please do a Pull Request to add your paper here! 
+BSD 3-Clause-style license inherited from SeQUeNCe; see [`LICENSE`](LICENSE).
