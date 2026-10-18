@@ -101,8 +101,10 @@ cd qTCP-project
 conda create -n qtcp python=3.12 -y      # any Python 3.12 environment works
 conda activate qtcp
 pip install -r requirements.txt          # pinned versions used for the paper runs
-make install_editable                    # installs this SeQUeNCe fork in editable mode
 ```
+
+Run all commands from the repository root. `qtcp_bench.py` imports the local
+`sequence/` package directly, so no install step is needed.
 
 ```bash
 # check the plumbing (~30 s)
